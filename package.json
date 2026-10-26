@@ -1,0 +1,267 @@
+{
+  "name": "claude-inline-diff",
+  "displayName": "Claude Inline Diff",
+  "description": "在真实编辑器内高亮 Claude Code 的改动，并提供 Trae 式逐块审核流程（单栏内联审查，无 Split Diff）。",
+  "version": "0.1.0",
+  "publisher": "amireux",
+  "private": true,
+  "license": "MIT",
+  "engines": {
+    "vscode": "^1.94.0"
+  },
+  "categories": [
+    "Other",
+    "Source Control"
+  ],
+  "keywords": [
+    "claude",
+    "claude-code",
+    "diff",
+    "inline-diff",
+    "agent"
+  ],
+  "activationEvents": [
+    "onStartupFinished"
+  ],
+  "main": "./out/src/extension.js",
+  "extensionKind": [
+    "workspace"
+  ],
+  "contributes": {
+    "commands": [
+      {
+        "command": "claudeInlineDiff.openReview",
+        "title": "Claude: 打开内联审查",
+        "icon": "$(diff)"
+      },
+      {
+        "command": "claudeInlineDiff.acceptHunk",
+        "title": "Claude: 标记此改动为已审核",
+        "icon": "$(check)"
+      },
+      {
+        "command": "claudeInlineDiff.acceptFile",
+        "title": "Claude: 标记此文件为已审核",
+        "icon": "$(check-all)"
+      },
+      {
+        "command": "claudeInlineDiff.acceptAll",
+        "title": "Claude: 标记全部为已审核",
+        "icon": "$(check-all)"
+      },
+      {
+        "command": "claudeInlineDiff.resetReviewed",
+        "title": "Claude: 重置已审核标记",
+        "icon": "$(history)"
+      },
+      {
+        "command": "claudeInlineDiff.refresh",
+        "title": "Claude: 刷新改动",
+        "icon": "$(refresh)"
+      },
+      {
+        "command": "claudeInlineDiff.showMenu",
+        "title": "Claude: 显示变更审查菜单",
+        "icon": "$(diff)"
+      },
+      {
+        "command": "claudeInlineDiff.selectSession",
+        "title": "Claude: 选择会话",
+        "icon": "$(server-process)"
+      },
+      {
+        "command": "claudeInlineDiff.openSourceAt",
+        "title": "Claude: 在源文件中打开"
+      },
+      {
+        "command": "claudeInlineDiff.showOutput",
+        "title": "Claude: 显示日志",
+        "icon": "$(output)"
+      }
+    ],
+    "configuration": {
+      "title": "Claude Inline Diff",
+      "properties": {
+        "claudeInlineDiff.enabled": {
+          "type": "boolean",
+          "default": true,
+          "description": "启用 Claude 改动的行内高亮与审查流程。"
+        },
+        "claudeInlineDiff.baselineMode": {
+          "type": "string",
+          "enum": [
+            "session",
+            "turn"
+          ],
+          "enumDescriptions": [
+            "累计整个 Claude 会话中的未审核改动。",
+            "只显示最近一次提问之后的改动；已审核标记仍然会隐藏对应内容。"
+          ],
+          "default": "session",
+          "description": "未审核改动的基线范围。无论选哪个，已标记为审核的内容都不会再高亮。"
+        },
+        "claudeInlineDiff.showDeletedSummary": {
+          "type": "boolean",
+          "default": true,
+          "description": "在删除接缝处的红色箭头旁显示“− N 行已删除”。关闭后只显示箭头。"
+        },
+        "claudeInlineDiff.sessionMaxAgeHours": {
+          "type": "number",
+          "default": 168,
+          "minimum": 1,
+          "description": "只跟踪最近多少小时内活跃过的 Claude 会话。"
+        },
+        "claudeInlineDiff.maxFileSizeKB": {
+          "type": "number",
+          "default": 5120,
+          "minimum": 16,
+          "description": "超过此大小的文件不参与行内 diff。"
+        },
+        "claudeInlineDiff.exclude": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "default": [
+            "**/node_modules/**",
+            "**/.git/**",
+            "**/dist/**",
+            "**/out/**",
+            "**/.venv/**",
+            "**/__pycache__/**",
+            "**/target/**",
+            "**/.next/**",
+            "**/.cache/**",
+            "**/*.min.js",
+            "**/*.map"
+          ],
+          "description": "不参与审查工作区的 glob 模式（相对于工作区根目录）。"
+        },
+        "claudeInlineDiff.showCompletionStatus": {
+          "type": "boolean",
+          "default": true,
+          "description": "Claude 停止写入约 5 秒后，在状态栏短暂高亮待审文件数量（不弹窗）。"
+        }
+      }
+    },
+    "views": {
+      "explorer": [
+        {
+          "id": "claudeInlineDiff.changes",
+          "name": "Claude 变更审查",
+          "contextualTitle": "Claude 变更审查",
+          "when": "claudeInlineDiff.hasChanges",
+          "icon": "$(diff)"
+        }
+      ]
+    },
+    "menus": {
+      "view/title": [
+        {
+          "command": "claudeInlineDiff.acceptAll",
+          "when": "view == claudeInlineDiff.changes && claudeInlineDiff.hasChanges",
+          "group": "navigation@1"
+        },
+        {
+          "command": "claudeInlineDiff.resetReviewed",
+          "when": "view == claudeInlineDiff.changes && claudeInlineDiff.hasChanges",
+          "group": "navigation@2"
+        },
+        {
+          "command": "claudeInlineDiff.selectSession",
+          "when": "view == claudeInlineDiff.changes",
+          "group": "navigation@3"
+        },
+        {
+          "command": "claudeInlineDiff.refresh",
+          "when": "view == claudeInlineDiff.changes",
+          "group": "navigation@4"
+        }
+      ],
+      "view/item/context": [
+        {
+          "command": "claudeInlineDiff.acceptFile",
+          "when": "view == claudeInlineDiff.changes && viewItem == claudeChangeFile",
+          "group": "inline@1"
+        },
+        {
+          "command": "claudeInlineDiff.openReview",
+          "when": "view == claudeInlineDiff.changes && viewItem == claudeChangeFile",
+          "group": "inline@2"
+        },
+        {
+          "command": "claudeInlineDiff.acceptHunk",
+          "when": "view == claudeInlineDiff.changes && viewItem == claudeChangeHunk",
+          "group": "inline@1"
+        },
+        {
+          "command": "claudeInlineDiff.openReview",
+          "when": "view == claudeInlineDiff.changes && viewItem == claudeChangeHunk",
+          "group": "inline@2"
+        }
+      ],
+      "editor/title": [
+        {
+          "command": "claudeInlineDiff.openReview",
+          "when": "resourceScheme == file && claudeInlineDiff.activeFileHasChanges",
+          "group": "navigation@20"
+        },
+        {
+          "command": "claudeInlineDiff.acceptFile",
+          "when": "resourceScheme == file && claudeInlineDiff.activeFileHasChanges",
+          "group": "navigation@21"
+        }
+      ],
+      "editor/context": [
+        {
+          "command": "claudeInlineDiff.openReview",
+          "when": "resourceScheme == file && claudeInlineDiff.activeFileHasChanges",
+          "group": "claudeInlineDiff@1"
+        }
+      ],
+      "commandPalette": [
+        {
+          "command": "claudeInlineDiff.openSourceAt",
+          "when": "false"
+        },
+        {
+          "command": "claudeInlineDiff.openReview",
+          "when": "claudeInlineDiff.activeFileHasChanges"
+        },
+        {
+          "command": "claudeInlineDiff.acceptHunk",
+          "when": "claudeInlineDiff.activeFileHasChanges"
+        },
+        {
+          "command": "claudeInlineDiff.acceptFile",
+          "when": "claudeInlineDiff.activeFileHasChanges"
+        },
+        {
+          "command": "claudeInlineDiff.acceptAll",
+          "when": "claudeInlineDiff.hasChanges"
+        },
+        {
+          "command": "claudeInlineDiff.resetReviewed",
+          "when": "claudeInlineDiff.hasChanges"
+        }
+      ]
+    }
+  },
+  "scripts": {
+    "compile": "tsc -p ./",
+    "watch": "tsc -watch -p ./",
+    "test": "npm run compile && node --test out/test/*.test.js",
+    "vscode:prepublish": "npm run compile",
+    "package": "vsce package"
+  },
+  "dependencies": {
+    "diff": "^9.0.0",
+    "minimatch": "^9.0.5"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.0",
+    "@types/vscode": "1.94.0",
+    "@vscode/vsce": "^4.0.0",
+    "typescript": "^5.7.0"
+  }
+}
