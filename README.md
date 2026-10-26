@@ -1,4 +1,4 @@
-# Claude Inline Diff
+# claude-inlineDiff
 VsCode插件
 Trae 风格的 Claude Code 行内改动审查：vscode的Claude code插件 在 auto 模式下改完代码后不会高亮显示修改内容，本工具实现在编辑器中集中标出新增、修改与删除，支持一次性审核和逐条确认。
 
