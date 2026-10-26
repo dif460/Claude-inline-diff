@@ -92,9 +92,10 @@ export class DecorationManager implements vscode.Disposable {
   private readonly removedText: vscode.TextEditorDecorationType;
 
   constructor(extensionUri: vscode.Uri) {
-    const addedIcon = vscode.Uri.joinPath(extensionUri, 'media', 'added-line.svg');
-    const modifiedIcon = vscode.Uri.joinPath(extensionUri, 'media', 'modified-line.svg');
-    const removedIcon = vscode.Uri.joinPath(extensionUri, 'media', 'removed-line.svg');
+    // gutter 图标使用 PNG（32x32，HiDPI 下仍清晰），不使用 SVG。
+    const addedIcon = vscode.Uri.joinPath(extensionUri, 'media', 'added-line.png');
+    const modifiedIcon = vscode.Uri.joinPath(extensionUri, 'media', 'modified-line.png');
+    const removedIcon = vscode.Uri.joinPath(extensionUri, 'media', 'removed-line.png');
     this.addedLine = vscode.window.createTextEditorDecorationType({
       isWholeLine: true,
       backgroundColor: ADDED_LINE_BG,
