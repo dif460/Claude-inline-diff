@@ -2,7 +2,7 @@
   "name": "claude-inlineDiff",
   "displayName": "claude-inlineDiff",
   "description": "在真实编辑器内高亮 Claude Code 的改动，并提供 Trae 式逐块审核流程（单栏内联审查，无 Split Diff）。",
-  "version": "1.1.0",
+  "version": "0.1.1",
   "publisher": "Amireux",
   "private": true,
   "license": "MIT",
