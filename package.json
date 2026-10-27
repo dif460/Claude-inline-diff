@@ -2,10 +2,11 @@
   "name": "claude-inlineDiff",
   "displayName": "claude-inlineDiff",
   "description": "在真实编辑器内高亮 Claude Code 的改动，并提供 Trae 式逐块审核流程（单栏内联审查，无 Split Diff）。",
-  "version": "0.1.0",
+  "version": "1.1.0",
   "publisher": "Amireux",
   "private": true,
   "license": "MIT",
+  "icon": "media/claude-logo.png",
   "engines": {
     "vscode": "^1.94.0"
   },
@@ -53,6 +54,21 @@
         "command": "claudeInlineDiff.resetReviewed",
         "title": "Claude: 重置已审核标记",
         "icon": "$(history)"
+      },
+      {
+        "command": "claudeInlineDiff.rejectHunk",
+        "title": "Claude: 拒绝此改动（还原）",
+        "icon": "$(discard)"
+      },
+      {
+        "command": "claudeInlineDiff.rejectFile",
+        "title": "Claude: 拒绝此文件的全部改动",
+        "icon": "$(discard)"
+      },
+      {
+        "command": "claudeInlineDiff.rejectAll",
+        "title": "Claude: 拒绝全部改动",
+        "icon": "$(trash)"
       },
       {
         "command": "claudeInlineDiff.refresh",
@@ -176,6 +192,11 @@
           "command": "claudeInlineDiff.refresh",
           "when": "view == claudeInlineDiff.changes",
           "group": "navigation@4"
+        },
+        {
+          "command": "claudeInlineDiff.rejectAll",
+          "when": "view == claudeInlineDiff.changes && claudeInlineDiff.hasChanges",
+          "group": "navigation@5"
         }
       ],
       "view/item/context": [
@@ -190,9 +211,19 @@
           "group": "inline@2"
         },
         {
+          "command": "claudeInlineDiff.rejectFile",
+          "when": "view == claudeInlineDiff.changes && viewItem == claudeChangeFile",
+          "group": "inline@3"
+        },
+        {
           "command": "claudeInlineDiff.acceptHunk",
           "when": "view == claudeInlineDiff.changes && viewItem == claudeChangeHunk",
           "group": "inline@1"
+        },
+        {
+          "command": "claudeInlineDiff.rejectHunk",
+          "when": "view == claudeInlineDiff.changes && viewItem == claudeChangeHunk",
+          "group": "inline@3"
         },
         {
           "command": "claudeInlineDiff.openReview",
@@ -210,6 +241,11 @@
           "command": "claudeInlineDiff.acceptFile",
           "when": "resourceScheme == file && claudeInlineDiff.activeFileHasChanges",
           "group": "navigation@21"
+        },
+        {
+          "command": "claudeInlineDiff.rejectFile",
+          "when": "resourceScheme == file && claudeInlineDiff.activeFileHasChanges",
+          "group": "navigation@22"
         }
       ],
       "editor/context": [
@@ -217,6 +253,11 @@
           "command": "claudeInlineDiff.openReview",
           "when": "resourceScheme == file && claudeInlineDiff.activeFileHasChanges",
           "group": "claudeInlineDiff@1"
+        },
+        {
+          "command": "claudeInlineDiff.rejectHunk",
+          "when": "resourceScheme == file && claudeInlineDiff.activeFileHasChanges",
+          "group": "claudeInlineDiff@2"
         }
       ],
       "commandPalette": [
@@ -242,6 +283,18 @@
         },
         {
           "command": "claudeInlineDiff.resetReviewed",
+          "when": "claudeInlineDiff.hasChanges"
+        },
+        {
+          "command": "claudeInlineDiff.rejectHunk",
+          "when": "claudeInlineDiff.activeFileHasChanges"
+        },
+        {
+          "command": "claudeInlineDiff.rejectFile",
+          "when": "claudeInlineDiff.activeFileHasChanges"
+        },
+        {
+          "command": "claudeInlineDiff.rejectAll",
           "when": "claudeInlineDiff.hasChanges"
         }
       ]

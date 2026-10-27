@@ -109,7 +109,45 @@ test('new files use an empty baseline', async () => {
   const changes = await buildWith(state, 'created\n');
   assert.equal(changes.length, 1);
   assert.equal(changes[0].baselineText, '');
+  assert.equal(changes[0].baselineExisted, false);
   assert.equal(changes[0].addedCount, 1);
+});
+
+test('existing files keep the baseline-existed flag so reject restores content', async () => {
+  const changes = await buildWith(baseState(), 'line1\nline2\nline3\n');
+  assert.equal(changes.length, 1);
+  assert.equal(changes[0].baselineExisted, true);
+});
+
+test('deleted files are reported with their whole baseline as removed', async () => {
+  const changes = await buildFileChanges({
+    session: baseState(),
+    sessionId: 'session-1',
+    baselineMode: 'session',
+    localBaselines: new Map(),
+    workspaceRoots: [ROOT],
+    exclude: [],
+    maxFileSizeBytes: 1024 * 1024,
+    readBackup: async (name) => (name === 'v1@v1' ? 'line1\nline2\n' : null),
+    readCurrent: async () => ({ text: '', missing: true })
+  });
+  assert.equal(changes.length, 1);
+  const change = changes[0];
+  assert.equal(change.currentMissing, true);
+  assert.equal(change.baselineExisted, true);
+  assert.equal(change.baselineText, 'line1\nline2\n');
+  assert.equal(change.removedCount, 2);
+  assert.equal(change.addedCount, 0);
+  assert.equal(change.diff.hunks[0].kind, 'remove');
+});
+
+test('local reviewed baselines always count as an existing file', async () => {
+  const local = new Map<string, LocalBaseline>([
+    [pathKey(FILE), { path: FILE, text: 'line1\n' }]
+  ]);
+  const changes = await buildWith(baseState(), 'line1\nline2\n', { localBaselines: local });
+  assert.equal(changes.length, 1);
+  assert.equal(changes[0].baselineExisted, true);
 });
 
 test('excluded paths are skipped', async () => {

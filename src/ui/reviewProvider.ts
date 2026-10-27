@@ -173,6 +173,14 @@ export class ReviewProvider implements vscode.TextDocumentContentProvider, vscod
         arguments: [model.change.path]
       })
     );
+    lenses.push(
+      new vscode.CodeLens(headerRange, {
+        title: '$(discard) 拒绝此文件的全部改动',
+        tooltip: '把工作区文件还原到 Claude 修改前的内容',
+        command: 'claudeInlineDiff.rejectFile',
+        arguments: [model.change.path]
+      })
+    );
     for (const hunk of model.change.diff.hunks) {
       const line = model.hunkStartLine.get(hunk.signature);
       if (line === undefined || line >= document.lineCount) {
@@ -184,6 +192,14 @@ export class ReviewProvider implements vscode.TextDocumentContentProvider, vscod
           title: '$(check) 标记此改动为已审核',
           tooltip: '仅标记为已审核，不会修改代码',
           command: 'claudeInlineDiff.acceptHunk',
+          arguments: [model.change.path, hunk.signature]
+        })
+      );
+      lenses.push(
+        new vscode.CodeLens(range, {
+          title: '$(discard) 拒绝此改动',
+          tooltip: '把这一处改动还原到 Claude 修改前的内容',
+          command: 'claudeInlineDiff.rejectHunk',
           arguments: [model.change.path, hunk.signature]
         })
       );

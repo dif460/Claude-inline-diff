@@ -15,6 +15,8 @@ export interface FileChange {
   root: string;
   sessionId: string;
   baselineText: string;
+  /** False when Claude created the file: rejecting the change deletes it. */
+  baselineExisted: boolean;
   currentText: string;
   currentMissing: boolean;
   eol: Eol;
@@ -117,21 +119,27 @@ function collectCandidates(session: Readonly<TranscriptState>): Map<string, Path
   return candidates;
 }
 
+interface BaselineText {
+  text: string;
+  existed: boolean;
+}
+
 async function readBaselineForEvent(
   event: BackupEvent,
   readBackup: (backupFileName: string) => Promise<string | null>
-): Promise<string | undefined> {
+): Promise<BaselineText | undefined> {
   if (event.backup.backupFileName === null) {
-    return '';
+    // No backup means the file did not exist before Claude touched it.
+    return { text: '', existed: false };
   }
   const text = await readBackup(event.backup.backupFileName);
-  return text === null ? undefined : text;
+  return text === null ? undefined : { text, existed: true };
 }
 
 async function resolveTranscriptBaseline(
   candidate: PathCandidate,
   input: BuildChangesInput
-): Promise<string | undefined> {
+): Promise<BaselineText | undefined> {
   if (input.baselineMode === 'session') {
     const first = candidate.events[0];
     if (!first) {
@@ -196,14 +204,14 @@ export async function buildFileChanges(input: BuildChangesInput): Promise<FileCh
     seen.add(key);
 
     const localBaseline = input.localBaselines.get(key);
-    let baselineText: string | undefined = localBaseline?.text;
-    if (baselineText === undefined) {
-      baselineText = await resolveTranscriptBaseline(candidate, input);
-    }
-    if (baselineText === undefined) {
+    const baseline: BaselineText | undefined = localBaseline
+      ? { text: localBaseline.text, existed: true }
+      : await resolveTranscriptBaseline(candidate, input);
+    if (baseline === undefined) {
       input.log?.(`Skipping ${candidate.displayPath}: original snapshot is unavailable.`);
       continue;
     }
+    const baselineText = baseline.text;
 
     const location = workspaceLocation(candidate.displayPath, input.workspaceRoots);
     if (!location) {
@@ -241,6 +249,7 @@ export async function buildFileChanges(input: BuildChangesInput): Promise<FileCh
       root: location.root,
       sessionId: input.sessionId,
       baselineText: cleanBaseline,
+      baselineExisted: baseline.existed,
       currentText: cleanCurrent,
       currentMissing: current.missing,
       eol: currentSplit.eol,

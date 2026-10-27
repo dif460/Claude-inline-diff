@@ -100,6 +100,53 @@ test('parses prompts, snapshots, deltas and turn ends', async () => {
   }
 });
 
+test('resolves relative tracking paths against realParentDir', async () => {
+  const dir = await fs.promises.mkdtemp(path.join(os.tmpdir(), 'claude-inline-transcript-'));
+  const filePath = path.join(dir, 'session-1.jsonl');
+  const absFile = path.join(dir, 'src', 'a.ts');
+  const parentDir = path.dirname(absFile);
+  const relFile = path.join('src', 'a.ts');
+  const content =
+    line({
+      type: 'file-history-snapshot',
+      messageId: 'prompt-1',
+      snapshot: {
+        messageId: 'prompt-1',
+        timestamp: '2025-01-01T00:00:01.000Z',
+        trackedFileBackups: {
+          [relFile]: {
+            backupFileName: 'abc123@v1',
+            version: 1,
+            backupTime: '2025-01-01T00:00:01.000Z',
+            realParentDir: parentDir
+          }
+        }
+      }
+    }) +
+    line({
+      type: 'file-history-delta',
+      snapshotMessageId: 'prompt-1',
+      trackingPath: relFile,
+      timestamp: '2025-01-01T00:00:02.000Z',
+      backup: {
+        backupFileName: null,
+        version: 1,
+        backupTime: '2025-01-01T00:00:02.000Z',
+        realParentDir: parentDir
+      }
+    });
+  await fs.promises.writeFile(filePath, content, 'utf8');
+  try {
+    const parser = new TranscriptParser(filePath);
+    await parser.update();
+    const state = parser.getState();
+    assert.equal(state.deltas[0].trackingPath, absFile);
+    assert.deepEqual([...[...state.snapshots.values()][0].tracked.keys()], [absFile]);
+  } finally {
+    await fs.promises.rm(dir, { recursive: true, force: true });
+  }
+});
+
 test('resets state when the transcript is replaced by a shorter file', async () => {
   const dir = await fs.promises.mkdtemp(path.join(os.tmpdir(), 'claude-inline-transcript-'));
   const filePath = path.join(dir, 'session-1.jsonl');

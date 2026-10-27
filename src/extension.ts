@@ -12,7 +12,8 @@ import {
 import {
   applyHunkToBaseline,
   findHunkAtLine,
-  findHunkBySignature
+  findHunkBySignature,
+  revertHunkInCurrent
 } from './core/lineDiff';
 import { joinLines, pathKey, splitText } from './core/lines';
 import { BaselineStore } from './storage/baselineStore';
@@ -107,6 +108,11 @@ export class ClaudeInlineDiffController implements vscode.Disposable {
   private changes: FileChange[] = [];
   private changesByKey = new Map<string, FileChange>();
   private pinnedSessionId: string | undefined;
+  /** Session this window adopted; kept until another transcript grows while focused. */
+  private boundSessionId: string | undefined;
+  private windowFocused = vscode.window.state.focused;
+  private readonly sessionSizes = new Map<string, { size: number; mtimeMs: number }>();
+  private sawFirstDiscovery = false;
 
   private discoveredSessions: SessionCandidate[] = [];
   private lastDiscoveryAt = 0;
@@ -214,6 +220,13 @@ export class ClaudeInlineDiffController implements vscode.Disposable {
       this.acceptFile(this.unwrapFsPath(first))
     );
     register('claudeInlineDiff.acceptAll', () => this.acceptAll());
+    register('claudeInlineDiff.rejectHunk', (first?: unknown, second?: unknown) =>
+      this.rejectHunk(this.unwrapFsPath(first), this.unwrapSignature(second) ?? this.unwrapSignature(first))
+    );
+    register('claudeInlineDiff.rejectFile', (first?: unknown) =>
+      this.rejectFile(this.unwrapFsPath(first))
+    );
+    register('claudeInlineDiff.rejectAll', () => this.rejectAll());
     register('claudeInlineDiff.resetReviewed', () => this.resetReviewed());
     register('claudeInlineDiff.refresh', () => this.refresh(true));
     register('claudeInlineDiff.showMenu', () => this.showMenu());
@@ -231,6 +244,9 @@ export class ClaudeInlineDiffController implements vscode.Disposable {
 
   private registerListeners(): void {
     this.disposables.push(
+      vscode.window.onDidChangeWindowState((state) => {
+        this.windowFocused = state.focused;
+      }),
       vscode.window.onDidChangeActiveTextEditor(() => {
         this.applyDecorations();
         void this.updateContextKeys();
@@ -248,20 +264,29 @@ export class ClaudeInlineDiffController implements vscode.Disposable {
         if (event.document.uri.scheme !== 'file') {
           return;
         }
-        // External edits (Claude writing the file) reload the document, which
-        // leaves it clean. Keystrokes by the user leave it dirty; only the
-        // saved state matters for the diff baseline.
-        if (!event.document.isDirty && event.contentChanges.length > 0) {
-          this.workspaceDirty = true;
-          this.scheduleRefresh(500);
+        if (event.contentChanges.length === 0) {
+          return;
         }
+        // Manual edits only belong to the review while this window still has
+        // unreviewed Claude changes; once everything is reviewed, edits the
+        // user makes afterwards are not tracked.
+        if (event.document.isDirty && !this.hasPendingReview()) {
+          return;
+        }
+        // Unsaved keystrokes are part of the review too: the diff reads the
+        // dirty editor buffer, so manual edits show up immediately.
+        this.workspaceDirty = true;
+        this.scheduleRefresh(event.document.isDirty ? 400 : 500);
       }),
       vscode.workspace.onDidSaveTextDocument((document) => {
-        if (document.uri.scheme === 'file') {
+        if (document.uri.scheme === 'file' && this.hasPendingReview()) {
           this.workspaceDirty = true;
           this.scheduleRefresh(200);
         }
       }),
+      // Pick up files Claude creates or deletes on disk, and manual file-level
+      // changes the user makes outside the editor while a review is in progress.
+      ...this.createFileWatcherDisposables(),
       vscode.workspace.onDidChangeWorkspaceFolders(() => {
         this.lastDiscoveryAt = 0;
         this.workspaceDirty = true;
@@ -282,6 +307,28 @@ export class ClaudeInlineDiffController implements vscode.Disposable {
         }
       })
     );
+  }
+
+  private createFileWatcherDisposables(): vscode.Disposable[] {
+    const watcher = vscode.workspace.createFileSystemWatcher('**/*');
+    const refresh = (): void => {
+      // Same rule as editor edits: manual file-level changes (Explorer, git,
+      // another tool) only count while a Claude change is still unreviewed.
+      if (!this.hasPendingReview()) {
+        return;
+      }
+      this.workspaceDirty = true;
+      this.scheduleRefresh(300);
+    };
+    return [watcher, watcher.onDidCreate(refresh), watcher.onDidDelete(refresh), watcher.onDidChange(refresh)];
+  }
+
+  /**
+   * True while this window still holds unreviewed Claude changes. Manual edits
+   * are only folded into the diff during that window.
+   */
+  private hasPendingReview(): boolean {
+    return this.changes.length > 0;
   }
 
   private scheduleRefresh(delay: number): void {
@@ -320,13 +367,15 @@ export class ClaudeInlineDiffController implements vscode.Disposable {
 
       const now = Date.now();
       let sessions = this.discoveredSessions;
+      let activeSession: SessionCandidate | undefined;
       if (force || !this.session || now - this.lastDiscoveryAt > DISCOVERY_INTERVAL_MS) {
         sessions = await discoverSessions(roots, this.settings.sessionMaxAgeHours);
         this.discoveredSessions = sessions;
         this.lastDiscoveryAt = now;
+        activeSession = this.detectActiveSession(sessions);
       }
 
-      const target = this.pickSession(sessions);
+      const target = this.pickSession(sessions, activeSession);
       if (!target) {
         await this.clearAll();
         return;
@@ -411,7 +460,36 @@ export class ClaudeInlineDiffController implements vscode.Disposable {
     this.startCompletionFlash(this.changes.length);
   }
 
-  private pickSession(sessions: SessionCandidate[]): SessionCandidate | undefined {
+  /**
+   * Finds the transcript that grew since the previous discovery. Several
+   * VS Code windows can share one workspace, so "newest by mtime" is not a
+   * reliable signal; the session this window is actually talking to grows
+   * while this window is focused.
+   */
+  private detectActiveSession(sessions: SessionCandidate[]): SessionCandidate | undefined {
+    const firstDiscovery = !this.sawFirstDiscovery;
+    this.sawFirstDiscovery = true;
+    let active: SessionCandidate | undefined;
+    for (const session of sessions) {
+      const previous = this.sessionSizes.get(session.sessionId);
+      const grew = previous
+        ? session.size > previous.size || session.mtimeMs > previous.mtimeMs
+        : !firstDiscovery;
+      if (grew && (active === undefined || session.mtimeMs > active.mtimeMs)) {
+        active = session;
+      }
+    }
+    this.sessionSizes.clear();
+    for (const session of sessions) {
+      this.sessionSizes.set(session.sessionId, { size: session.size, mtimeMs: session.mtimeMs });
+    }
+    return this.windowFocused ? active : undefined;
+  }
+
+  private pickSession(
+    sessions: SessionCandidate[],
+    activeSession: SessionCandidate | undefined
+  ): SessionCandidate | undefined {
     if (sessions.length === 0) {
       return undefined;
     }
@@ -421,24 +499,23 @@ export class ClaudeInlineDiffController implements vscode.Disposable {
         return pinned;
       }
     }
-    if (!this.session) {
+    // Only adopt a different conversation when it is the one actually being
+    // written in this window; never switch just because another window's
+    // transcript is newer.
+    if (activeSession) {
+      this.boundSessionId = activeSession.sessionId;
+    }
+    if (this.boundSessionId) {
+      const bound = sessions.find((candidate) => candidate.sessionId === this.boundSessionId);
+      if (bound) {
+        return bound;
+      }
+    }
+    const currentId = this.session?.sessionId;
+    if (!currentId) {
       return sessions[0];
     }
-    const current = sessions.find((candidate) => candidate.sessionId === this.session?.sessionId);
-    const newest = sessions[0];
-    if (!current) {
-      return newest;
-    }
-    // Without an explicit pin, follow a newer conversation (for example a new
-    // Claude chat started after this window was opened).
-    if (
-      !this.pinnedSessionId &&
-      newest.sessionId !== current.sessionId &&
-      newest.mtimeMs > current.mtimeMs + 1000
-    ) {
-      return newest;
-    }
-    return current;
+    return sessions.find((candidate) => candidate.sessionId === currentId) ?? sessions[0];
   }
 
   private async activateSession(session: SessionCandidate): Promise<void> {
@@ -458,6 +535,24 @@ export class ClaudeInlineDiffController implements vscode.Disposable {
   }
 
   private async readCurrent(fsPath: string): Promise<{ text: string; missing: boolean; tooLarge?: boolean }> {
+    // While this window still has unreviewed Claude changes, a manually edited
+    // buffer (including unsaved changes) is reviewed alongside them. Once the
+    // review is finished, the on-disk content is authoritative again.
+    const openDocument = this.hasPendingReview()
+      ? vscode.workspace.textDocuments.find(
+          (document) =>
+            document.uri.scheme === 'file' &&
+            document.isDirty &&
+            pathKey(document.uri.fsPath) === pathKey(fsPath)
+        )
+      : undefined;
+    if (openDocument) {
+      const liveText = openDocument.getText();
+      if (liveText.length > this.settings.maxFileSizeBytes) {
+        return { text: '', missing: false, tooLarge: true };
+      }
+      return { text: liveText, missing: false };
+    }
     try {
       const stat = await fs.promises.stat(fsPath);
       if (stat.size > this.settings.maxFileSizeBytes) {
@@ -729,6 +824,180 @@ export class ClaudeInlineDiffController implements vscode.Disposable {
     }
   }
 
+  private async confirmReject(message: string): Promise<boolean> {
+    const choice = await vscode.window.showWarningMessage(message, { modal: true }, '拒绝修改');
+    return choice === '拒绝修改';
+  }
+
+  private dirtyDocumentFor(fsPath: string): vscode.TextDocument | undefined {
+    return vscode.workspace.textDocuments.find(
+      (document) =>
+        document.uri.scheme === 'file' &&
+        document.isDirty &&
+        pathKey(document.uri.fsPath) === pathKey(fsPath)
+    );
+  }
+
+  private async writeFileContent(fsPath: string, text: string): Promise<void> {
+    await vscode.workspace.fs.writeFile(vscode.Uri.file(fsPath), Buffer.from(text, 'utf8'));
+  }
+
+  private async deleteFileContent(fsPath: string): Promise<void> {
+    try {
+      await vscode.workspace.fs.delete(vscode.Uri.file(fsPath), { useTrash: true });
+    } catch (error) {
+      // Already gone (deleted by hand): the end state is what reject wants.
+      if ((error as { code?: string }).code !== 'FileNotFound') {
+        throw error;
+      }
+    }
+  }
+
+  private async rejectHunk(fsPath?: string, signature?: string): Promise<void> {
+    let path = fsPath;
+    let hunkSignature = signature;
+    if (!path || !hunkSignature) {
+      const fromEditor = this.hunkFromActiveEditor();
+      if (!fromEditor) {
+        void vscode.window.showInformationMessage('请把光标放在待拒绝的改动行上，或从审查面板中选择一处改动。');
+        return;
+      }
+      path = fromEditor.fsPath;
+      hunkSignature = fromEditor.signature;
+    }
+    const targetPath = path;
+    const targetSignature = hunkSignature;
+    const change = this.changesByKey.get(pathKey(targetPath));
+    if (!change) {
+      void vscode.window.showInformationMessage('这处改动已不在待审核列表中。');
+      return;
+    }
+    const hunk = findHunkBySignature(change.diff, targetSignature);
+    if (!hunk) {
+      void vscode.window.showWarningMessage('找不到这处改动，可能已经被审核或代码已再次变化。');
+      return;
+    }
+    if (this.dirtyDocumentFor(change.path)) {
+      void vscode.window.showWarningMessage('该文件有未保存的修改，请先保存后再拒绝。');
+      return;
+    }
+    const confirmed = await this.confirmReject(
+      `将把 ${change.relativePath} 第 ${hunk.currentStart + 1} 行处的改动还原为 Claude 修改前的内容，` +
+        '这会直接修改工作区文件。'
+    );
+    if (!confirmed) {
+      return;
+    }
+    try {
+      await this.queueAccept(async () => {
+        // A deleted file has no current text; revert against an empty document
+        // and reuse the baseline's line endings when writing it back.
+        const currentSplit = change.currentMissing ? splitText('') : splitText(change.currentText);
+        const lines = revertHunkInCurrent(currentSplit.lines, hunk);
+        const eol = change.currentMissing ? splitText(change.baselineText).eol : currentSplit.eol;
+        if (lines.length === 0 && !change.baselineExisted) {
+          await this.deleteFileContent(change.path);
+        } else {
+          const finalNewline = change.currentMissing ? true : currentSplit.finalNewline;
+          await this.writeFileContent(change.path, joinLines(lines, eol, finalNewline));
+        }
+        await this.refresh(true);
+      });
+      void vscode.window.setStatusBarMessage('已还原 1 处改动', 2000);
+    } catch (error) {
+      void vscode.window.showWarningMessage(
+        error instanceof Error ? error.message : '拒绝改动失败。'
+      );
+    }
+  }
+
+  private async rejectFile(fsPath?: string): Promise<void> {
+    const path = fsPath ?? this.activeEditorPath();
+    if (!path) {
+      void vscode.window.showInformationMessage('请先在编辑器中打开一个文件，或从审查面板中选择。');
+      return;
+    }
+    const change = this.changesByKey.get(pathKey(path));
+    if (!change) {
+      void vscode.window.showInformationMessage('这个文件已没有待审核改动。');
+      return;
+    }
+    if (this.dirtyDocumentFor(change.path)) {
+      void vscode.window.showWarningMessage('该文件有未保存的修改，请先保存后再拒绝。');
+      return;
+    }
+    const confirmed = await this.confirmReject(
+      change.baselineExisted
+        ? `将把 ${change.relativePath} 还原到 Claude 修改前的内容，这会直接覆盖工作区文件。`
+        : `这个文件是 Claude 新建的，拒绝改动会把 ${change.relativePath} 删除。`
+    );
+    if (!confirmed) {
+      return;
+    }
+    try {
+      await this.queueAccept(async () => {
+        if (change.baselineExisted) {
+          await this.writeFileContent(change.path, change.baselineText);
+        } else {
+          await this.deleteFileContent(change.path);
+        }
+        await this.refresh(true);
+      });
+      void vscode.window.setStatusBarMessage('已还原该文件的改动', 2000);
+    } catch (error) {
+      void vscode.window.showWarningMessage(
+        error instanceof Error ? error.message : '拒绝改动失败。'
+      );
+    }
+  }
+
+  private async rejectAll(): Promise<void> {
+    if (this.changes.length === 0) {
+      return;
+    }
+    const dirty = this.changes.find((change) => this.dirtyDocumentFor(change.path));
+    if (dirty) {
+      void vscode.window.showWarningMessage(`${dirty.relativePath} 有未保存的修改，请先保存后再拒绝。`);
+      return;
+    }
+    const created = this.changes.filter((change) => !change.baselineExisted).length;
+    const confirmed = await this.confirmReject(
+      `将把 ${this.changes.length} 个文件还原到 Claude 修改前的内容` +
+        (created > 0 ? `，并删除其中 ${created} 个由 Claude 新建的文件` : '') +
+        '。这会直接修改工作区文件，且无法撤销。'
+    );
+    if (!confirmed) {
+      return;
+    }
+    const snapshot = this.changes;
+    const failed: string[] = [];
+    try {
+      await this.queueAccept(async () => {
+        for (const change of snapshot) {
+          try {
+            if (change.baselineExisted) {
+              await this.writeFileContent(change.path, change.baselineText);
+            } else {
+              await this.deleteFileContent(change.path);
+            }
+          } catch {
+            failed.push(change.relativePath);
+          }
+        }
+        await this.refresh(true);
+      });
+      if (failed.length > 0) {
+        void vscode.window.showWarningMessage(`以下文件还原失败：${failed.join('、')}`);
+        return;
+      }
+      void vscode.window.setStatusBarMessage(`已还原 ${snapshot.length} 个文件的改动`, 2500);
+    } catch (error) {
+      void vscode.window.showWarningMessage(
+        error instanceof Error ? error.message : '拒绝改动失败。'
+      );
+    }
+  }
+
   private async resetReviewed(): Promise<void> {
     if (!this.session) {
       return;
@@ -796,9 +1065,11 @@ export class ClaudeInlineDiffController implements vscode.Disposable {
     }
     if (picked.followLatest) {
       this.pinnedSessionId = undefined;
+      this.boundSessionId = undefined;
       await this.context.workspaceState.update(PINNED_SESSION_KEY, undefined);
     } else if (picked.session) {
       this.pinnedSessionId = picked.session.sessionId;
+      this.boundSessionId = picked.session.sessionId;
       await this.context.workspaceState.update(PINNED_SESSION_KEY, this.pinnedSessionId);
     }
     await this.refresh(true);
@@ -830,6 +1101,10 @@ export class ClaudeInlineDiffController implements vscode.Disposable {
       items.push({
         label: '$(check-all) 标记全部为已审核',
         run: () => this.acceptAll()
+      });
+      items.push({
+        label: '$(discard) 拒绝全部改动（还原文件）',
+        run: () => this.rejectAll()
       });
       items.push({
         label: '$(history) 重置已审核标记',

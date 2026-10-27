@@ -1,6 +1,12 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { applyHunkToBaseline, computeLineDiff, findHunkAtLine, findHunkBySignature } from '../src/core/lineDiff';
+import {
+  applyHunkToBaseline,
+  computeLineDiff,
+  findHunkAtLine,
+  findHunkBySignature,
+  revertHunkInCurrent
+} from '../src/core/lineDiff';
 
 test('detects a modification followed by an insertion', () => {
   const result = computeLineDiff(['a', 'b', 'c'], ['a', 'B', 'c', 'd']);
@@ -76,6 +82,24 @@ test('accepting a deletion-only hunk removes its anchor', () => {
   const updated = applyHunkToBaseline(baseline, current, result.hunks[0]);
   assert.deepEqual(updated, ['a']);
   assert.equal(computeLineDiff(updated, current).hunks.length, 0);
+});
+
+test('reverting a hunk restores the baseline text', () => {
+  const baseline = ['a', 'b', 'c', 'd'];
+  const current = ['a', 'B', 'c', 'd', 'e'];
+  const result = computeLineDiff(baseline, current);
+  let lines = [...current];
+  for (const hunk of [...result.hunks].reverse()) {
+    lines = revertHunkInCurrent(lines, hunk);
+  }
+  assert.deepEqual(lines, baseline);
+});
+
+test('reverting an insertion removes the added lines', () => {
+  const baseline = ['a'];
+  const current = ['a', 'x', 'y'];
+  const result = computeLineDiff(baseline, current);
+  assert.deepEqual(revertHunkInCurrent(current, result.hunks[0]), baseline);
 });
 
 test('handles empty baselines (new files) and empty current files (deletions)', () => {

@@ -14,7 +14,6 @@ const ADDED_WORD_BG = '#39cc6566';
 const REMOVED_WORD_BG = '#e6454566';
 const ADDED_SOLID = '#39cc65';
 const REMOVED_SOLID = '#e64545';
-const MODIFIED_SOLID = '#1b7a9e';
 
 export interface DecorationContext {
   changesByKey: Map<string, FileChange>;
@@ -46,8 +45,12 @@ function hoverTitle(hunk: DiffHunk): string {
 }
 
 function hoverForHunk(change: FileChange, hunk: DiffHunk): vscode.MarkdownString {
-  // 修改行不在编辑器里展示旧代码，删除内容只在单栏内联审查视图中显示。
+  // 删旧增新的改动同样展示被替换掉的旧内容，悬停即可查看。
   const lines: string[] = [hoverTitle(hunk), ''];
+  if (hunk.removed.length > 0) {
+    const fence = languageIdForPath(change.path) ?? '';
+    lines.push('已删除的旧内容：', '', '```' + fence, truncateText(hunk.removed.join('\n'), 4000), '```', '');
+  }
   lines.push(
     commandLink('打开内联审查', 'claudeInlineDiff.openReview', [change.path, hunk.signature])
   );
@@ -84,7 +87,6 @@ function clampRange(document: vscode.TextDocument, line: number, start: number, 
 
 export class DecorationManager implements vscode.Disposable {
   private readonly addedLine: vscode.TextEditorDecorationType;
-  private readonly modifiedLine: vscode.TextEditorDecorationType;
   private readonly addedText: vscode.TextEditorDecorationType;
   private readonly removedAnchor: vscode.TextEditorDecorationType;
   private readonly removedArrow: vscode.TextEditorDecorationType;
@@ -94,7 +96,6 @@ export class DecorationManager implements vscode.Disposable {
   constructor(extensionUri: vscode.Uri) {
     // gutter 图标使用 PNG（32x32，HiDPI 下仍清晰），不使用 SVG。
     const addedIcon = vscode.Uri.joinPath(extensionUri, 'media', 'added-line.png');
-    const modifiedIcon = vscode.Uri.joinPath(extensionUri, 'media', 'modified-line.png');
     const removedIcon = vscode.Uri.joinPath(extensionUri, 'media', 'removed-line.png');
     this.addedLine = vscode.window.createTextEditorDecorationType({
       isWholeLine: true,
@@ -103,15 +104,6 @@ export class DecorationManager implements vscode.Disposable {
       gutterIconPath: addedIcon,
       gutterIconSize: 'contain',
       overviewRulerColor: ADDED_SOLID,
-      overviewRulerLane: vscode.OverviewRulerLane.Left
-    });
-    // 修改行（删旧增新）仍使用绿色行背景，但 gutter 改为麻蓝色斜纹竖线。
-    this.modifiedLine = vscode.window.createTextEditorDecorationType({
-      isWholeLine: true,
-      backgroundColor: ADDED_LINE_BG,
-      gutterIconPath: modifiedIcon,
-      gutterIconSize: 'contain',
-      overviewRulerColor: MODIFIED_SOLID,
       overviewRulerLane: vscode.OverviewRulerLane.Left
     });
     this.addedText = vscode.window.createTextEditorDecorationType({
@@ -152,7 +144,6 @@ export class DecorationManager implements vscode.Disposable {
 
   private clear(editor: vscode.TextEditor): void {
     editor.setDecorations(this.addedLine, []);
-    editor.setDecorations(this.modifiedLine, []);
     editor.setDecorations(this.addedText, []);
     editor.setDecorations(this.removedAnchor, []);
     editor.setDecorations(this.removedArrow, []);
@@ -167,20 +158,18 @@ export class DecorationManager implements vscode.Disposable {
       return;
     }
     const addedRanges: vscode.DecorationOptions[] = [];
-    const modifiedRanges: vscode.DecorationOptions[] = [];
     const addedTextRanges: vscode.DecorationOptions[] = [];
     const removedRanges: vscode.DecorationOptions[] = [];
     const arrowRanges: vscode.DecorationOptions[] = [];
 
     for (const hunk of change.diff.hunks) {
       const hover = hoverForHunk(change, hunk);
-      const lineRanges = hunk.kind === 'modify' ? modifiedRanges : addedRanges;
       for (let i = 0; i < hunk.added.length; i++) {
         const line = hunk.currentStart + i;
         if (line < 0 || line >= editor.document.lineCount) {
           continue;
         }
-        lineRanges.push({
+        addedRanges.push({
           range: new vscode.Range(line, 0, line, 0),
           hoverMessage: hover
         });
@@ -198,15 +187,15 @@ export class DecorationManager implements vscode.Disposable {
     }
 
     for (const anchor of change.diff.deletionAnchors) {
-      // 修改块（删旧增新）不在编辑器中显示删除标记，旧代码只在内联审查视图中展示。
-      const pureRemovals = anchor.hunks.filter((hunk) => hunk.kind === 'remove');
-      if (pureRemovals.length === 0) {
+      // 删旧增新的改动同样在接缝处显示删除标记，旧内容可从悬停中查看。
+      const removals = anchor.hunks.filter((hunk) => hunk.removed.length > 0);
+      if (removals.length === 0) {
         continue;
       }
       const doc = editor.document;
       const line = Math.max(0, Math.min(anchor.anchor, doc.lineCount - 1));
-      const removedCount = pureRemovals.reduce((sum, hunk) => sum + hunk.removed.length, 0);
-      const hover = hoverForAnchor(change, pureRemovals);
+      const removedCount = removals.reduce((sum, hunk) => sum + hunk.removed.length, 0);
+      const hover = hoverForAnchor(change, removals);
       removedRanges.push({
         range: new vscode.Range(line, 0, line, doc.lineAt(line).text.length),
         hoverMessage: hover
@@ -243,7 +232,6 @@ export class DecorationManager implements vscode.Disposable {
     }
 
     editor.setDecorations(this.addedLine, addedRanges);
-    editor.setDecorations(this.modifiedLine, modifiedRanges);
     editor.setDecorations(this.addedText, addedTextRanges);
     editor.setDecorations(this.removedAnchor, removedRanges);
     editor.setDecorations(this.removedArrow, arrowRanges);
@@ -255,7 +243,7 @@ export class DecorationManager implements vscode.Disposable {
     if (!model) {
       return;
     }
-    // 审查视图统一使用绿/红竖线，麻蓝色只用于源文件编辑器的修改行。
+    // 审查视图同样只使用绿/红两种竖线。
     const addedLines: vscode.DecorationOptions[] = [];
     const removedLines: vscode.DecorationOptions[] = [];
     const addedTextRanges: vscode.DecorationOptions[] = [];
@@ -313,7 +301,6 @@ export class DecorationManager implements vscode.Disposable {
 
   dispose(): void {
     this.addedLine.dispose();
-    this.modifiedLine.dispose();
     this.addedText.dispose();
     this.removedAnchor.dispose();
     this.removedArrow.dispose();

@@ -5,6 +5,8 @@ export interface SnapshotFileBackup {
   backupFileName: string | null;
   version: number;
   backupTime: string;
+  /** Directory that contains the tracked file, as recorded by Claude Code. */
+  realParentDir?: string;
 }
 
 export interface TranscriptSnapshot {
@@ -62,7 +64,26 @@ function parseBackup(value: unknown): SnapshotFileBackup | undefined {
   if (version === undefined || backupTime === undefined || backupFileName === undefined) {
     return undefined;
   }
-  return { backupFileName, version, backupTime };
+  return { backupFileName, version, backupTime, realParentDir: asString(obj.realParentDir) };
+}
+
+/**
+ * Claude Code records the tracked file either as an absolute path or as a path
+ * relative to the directory that contains it (`realParentDir`). Resolve the
+ * relative form so every entry points at the real file instead of being
+ * resolved against the extension host's working directory.
+ */
+function resolveTrackingPath(trackingPath: string, backup: SnapshotFileBackup, cwd?: string): string {
+  if (path.isAbsolute(trackingPath)) {
+    return trackingPath;
+  }
+  if (backup.realParentDir) {
+    return path.join(backup.realParentDir, path.basename(trackingPath));
+  }
+  if (cwd) {
+    return path.join(cwd, trackingPath);
+  }
+  return trackingPath;
 }
 
 function isUserPrompt(content: unknown): boolean {
@@ -248,7 +269,7 @@ export class TranscriptParser {
       for (const [filePath, rawBackup] of Object.entries(rawTracked)) {
         const backup = parseBackup(rawBackup);
         if (backup) {
-          tracked.set(filePath, backup);
+          tracked.set(resolveTrackingPath(filePath, backup, this.state.cwd), backup);
         }
       }
     }
@@ -268,7 +289,12 @@ export class TranscriptParser {
     if (!trackingPath || !snapshotMessageId || !timestamp || !backup) {
       return false;
     }
-    this.state.deltas.push({ trackingPath, snapshotMessageId, timestamp, backup });
+    this.state.deltas.push({
+      trackingPath: resolveTrackingPath(trackingPath, backup, this.state.cwd),
+      snapshotMessageId,
+      timestamp,
+      backup
+    });
     return true;
   }
 

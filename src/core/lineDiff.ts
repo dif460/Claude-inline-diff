@@ -248,6 +248,16 @@ export function applyHunkToBaseline(baselineLines: string[], currentLines: strin
   return [...before, ...middle, ...after];
 }
 
+/**
+ * Reject one hunk: put the baseline (removed) lines back into the current
+ * document, undoing that piece of Claude's edit.
+ */
+export function revertHunkInCurrent(currentLines: string[], hunk: DiffHunk): string[] {
+  const before = currentLines.slice(0, hunk.currentStart);
+  const after = currentLines.slice(hunk.currentEnd);
+  return [...before, ...hunk.removed, ...after];
+}
+
 export function findHunkBySignature(result: LineDiffResult, signature: string): DiffHunk | undefined {
   return result.hunks.find((hunk) => hunk.signature === signature);
 }
