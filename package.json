@@ -6,7 +6,7 @@
   "publisher": "Amireux",
   "private": true,
   "license": "MIT",
-  "icon": "media/claude-logo.png",
+  "icon": "media/icon.png",
   "engines": {
     "vscode": "^1.94.0"
   },

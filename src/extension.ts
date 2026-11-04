@@ -134,7 +134,7 @@ export class ClaudeInlineDiffController implements vscode.Disposable {
   constructor(private readonly context: vscode.ExtensionContext) {
     this.output = vscode.window.createOutputChannel('Claude Inline Diff');
     this.baselineStore = new BaselineStore(context);
-    this.decorations = new DecorationManager(context.extensionUri);
+    this.decorations = new DecorationManager();
     this.statusBar = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Left, 90);
     this.statusBar.command = 'claudeInlineDiff.showMenu';
     this.treeView = vscode.window.createTreeView('claudeInlineDiff.changes', {

@@ -93,16 +93,11 @@ export class DecorationManager implements vscode.Disposable {
   private readonly removedLine: vscode.TextEditorDecorationType;
   private readonly removedText: vscode.TextEditorDecorationType;
 
-  constructor(extensionUri: vscode.Uri) {
-    // gutter 图标使用 PNG（32x32，HiDPI 下仍清晰），不使用 SVG。
-    const addedIcon = vscode.Uri.joinPath(extensionUri, 'media', 'added-line.png');
-    const removedIcon = vscode.Uri.joinPath(extensionUri, 'media', 'removed-line.png');
+  constructor() {
+    // 不再在行号槽绘制红绿竖线，仅保留整行背景与概览标尺标记。
     this.addedLine = vscode.window.createTextEditorDecorationType({
       isWholeLine: true,
       backgroundColor: ADDED_LINE_BG,
-      // Gutter 图标固定在行号左侧，不随横向滚动移动，避免左侧竖线被编辑器边框裁掉。
-      gutterIconPath: addedIcon,
-      gutterIconSize: 'contain',
       overviewRulerColor: ADDED_SOLID,
       overviewRulerLane: vscode.OverviewRulerLane.Left
     });
@@ -120,8 +115,6 @@ export class DecorationManager implements vscode.Disposable {
     this.removedLine = vscode.window.createTextEditorDecorationType({
       isWholeLine: true,
       backgroundColor: REMOVED_LINE_BG,
-      gutterIconPath: removedIcon,
-      gutterIconSize: 'contain',
       overviewRulerColor: REMOVED_SOLID,
       overviewRulerLane: vscode.OverviewRulerLane.Left
     });
@@ -243,7 +236,7 @@ export class DecorationManager implements vscode.Disposable {
     if (!model) {
       return;
     }
-    // 审查视图同样只使用绿/红两种竖线。
+    // 审查视图与源文件视图保持一致：整行背景 + 词级高亮，不绘制行号槽竖线。
     const addedLines: vscode.DecorationOptions[] = [];
     const removedLines: vscode.DecorationOptions[] = [];
     const addedTextRanges: vscode.DecorationOptions[] = [];

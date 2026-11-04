@@ -139,6 +139,10 @@ export class ReviewProvider implements vscode.TextDocumentContentProvider, vscod
         mergedLine = model.hunkStartLine.get(options.signature);
       } else if (options?.line !== undefined) {
         mergedLine = Math.max(0, Math.min(options.line, model.lines.length - 1));
+      } else {
+        // 从文件级入口打开时，直接定位到第一处改动，而不是停在文档顶部。
+        const firstHunk = model.change.diff.hunks[0];
+        mergedLine = firstHunk ? model.hunkStartLine.get(firstHunk.signature) : undefined;
       }
       if (mergedLine !== undefined) {
         const position = new vscode.Position(
