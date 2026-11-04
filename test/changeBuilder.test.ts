@@ -2,7 +2,13 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import * as os from 'os';
 import * as path from 'path';
-import { buildFileChanges, FileChange, LocalBaseline } from '../src/core/changeBuilder';
+import {
+  buildFileChanges,
+  FileChange,
+  latestClaudeEventTime,
+  LocalBaseline,
+  selectReviewChanges
+} from '../src/core/changeBuilder';
 import { buildReviewModel } from '../src/ui/reviewModel';
 import { pathKey } from '../src/core/lines';
 import { SnapshotFileBackup, TranscriptSnapshot, TranscriptState } from '../src/claude/transcript';
@@ -155,6 +161,50 @@ test('excluded paths are skipped', async () => {
     exclude: ['**/src/a.ts']
   });
   assert.equal(changes.length, 0);
+});
+
+test('each change reports the newest Claude event for its path', async () => {
+  const state = baseState();
+  state.deltas.push({
+    timestamp: '2025-01-01T00:05:00.000Z',
+    snapshotMessageId: 'prompt-1',
+    trackingPath: FILE,
+    backup: backup('v1@v1')
+  });
+  const changes = await buildWith(state, 'line1\nline2\nline3\n');
+  assert.equal(changes[0].lastClaudeEventAt, Date.parse('2025-01-01T00:05:00.000Z'));
+  // Only backup events count as Claude activity; user prompts do not.
+  assert.equal(latestClaudeEventTime(state), Date.parse('2025-01-01T00:05:00.000Z'));
+});
+
+test('review stays empty when no Claude event is newer than the reviewed watermark', async () => {
+  const changes = await buildWith(baseState(), 'line1\nline2\nline3\n');
+  assert.equal(changes.length, 1);
+  // Everything up to (and including) the newest event was already reviewed.
+  const reviewedThrough = latestClaudeEventTime(baseState());
+  assert.deepEqual(selectReviewChanges(changes, reviewedThrough), []);
+});
+
+test('an unreviewed Claude event surfaces every pending diff', async () => {
+  const changes = await buildWith(baseState(), 'line1\nline2\nline3\n');
+  assert.equal(selectReviewChanges(changes, 0).length, 1);
+});
+
+test('files tracked only by a local baseline never start a review', async () => {
+  const local = new Map<string, LocalBaseline>([
+    [pathKey(FILE), { path: FILE, text: 'line1\n' }]
+  ]);
+  const emptyState: TranscriptState = {
+    sessionId: 'session-1',
+    cwd: ROOT,
+    prompts: [],
+    snapshots: new Map(),
+    deltas: []
+  };
+  const changes = await buildWith(emptyState, 'line1\nline2\n', { localBaselines: local });
+  assert.equal(changes.length, 1);
+  assert.equal(changes[0].lastClaudeEventAt, 0);
+  assert.deepEqual(selectReviewChanges(changes, 0), []);
 });
 
 test('review model maps merged lines back to source lines', async () => {

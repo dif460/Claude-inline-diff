@@ -23,6 +23,11 @@ export interface FileChange {
   diff: LineDiffResult;
   addedCount: number;
   removedCount: number;
+  /**
+   * Timestamp (ms) of the newest backup event Claude recorded for this path,
+   * or 0 when the path only exists because of a stored local baseline.
+   */
+  lastClaudeEventAt: number;
 }
 
 export interface LocalBaseline {
@@ -81,6 +86,36 @@ function isExcluded(relativePath: string, patterns: string[]): boolean {
       return false;
     }
   });
+}
+
+function parseTimestamp(timestamp: string | undefined): number {
+  if (!timestamp) {
+    return 0;
+  }
+  const parsed = Date.parse(timestamp);
+  return Number.isFinite(parsed) ? parsed : 0;
+}
+
+/** Newest backup event timestamp (ms) present in the transcript, or 0. */
+export function latestClaudeEventTime(session: Readonly<TranscriptState>): number {
+  let latest = 0;
+  for (const snapshot of session.snapshots.values()) {
+    latest = Math.max(latest, parseTimestamp(snapshot.timestamp));
+  }
+  for (const delta of session.deltas) {
+    latest = Math.max(latest, parseTimestamp(delta.timestamp));
+  }
+  return latest;
+}
+
+/**
+ * Keeps the whole review empty unless at least one file carries a Claude edit
+ * that is newer than the last fully reviewed state. While such a change is
+ * pending every diff is shown (including manual/git edits), because they are
+ * part of what the user is reviewing; with nothing pending no diff is shown.
+ */
+export function selectReviewChanges(changes: FileChange[], reviewedThrough: number): FileChange[] {
+  return changes.some((change) => change.lastClaudeEventAt > reviewedThrough) ? changes : [];
 }
 
 function compareEvents(a: BackupEvent, b: BackupEvent): number {
@@ -255,7 +290,8 @@ export async function buildFileChanges(input: BuildChangesInput): Promise<FileCh
       eol: currentSplit.eol,
       diff,
       addedCount: diff.addedCount,
-      removedCount: diff.removedCount
+      removedCount: diff.removedCount,
+      lastClaudeEventAt: parseTimestamp(candidate.events[candidate.events.length - 1]?.timestamp)
     });
   }
 

@@ -15,6 +15,12 @@ interface StoredEntry {
 interface StoreIndex {
   version: 1;
   entries: Record<string, StoredEntry>;
+  /**
+   * Per session, the newest Claude transcript event (ms) that has already been
+   * fully reviewed. Diffs are only shown while the transcript holds an event
+   * newer than this watermark.
+   */
+  reviewedThrough: Record<string, number>;
 }
 
 const INDEX_VERSION = 1;
@@ -31,7 +37,7 @@ function keyFor(sessionId: string, fsPath: string): string {
 export class BaselineStore {
   private readonly root: string;
   private readonly indexPath: string;
-  private index: StoreIndex = { version: INDEX_VERSION, entries: {} };
+  private index: StoreIndex = { version: INDEX_VERSION, entries: {}, reviewedThrough: {} };
   private loaded = false;
   private writeChain: Promise<void> = Promise.resolve();
   private readonly textCache = new Map<string, string | null>();
@@ -51,10 +57,14 @@ export class BaselineStore {
       const raw = await fs.promises.readFile(this.indexPath, 'utf8');
       const parsed = JSON.parse(raw) as Partial<StoreIndex>;
       if (parsed && parsed.version === INDEX_VERSION && parsed.entries) {
-        this.index = { version: INDEX_VERSION, entries: parsed.entries };
+        this.index = {
+          version: INDEX_VERSION,
+          entries: parsed.entries,
+          reviewedThrough: parsed.reviewedThrough ?? {}
+        };
       }
     } catch {
-      this.index = { version: INDEX_VERSION, entries: {} };
+      this.index = { version: INDEX_VERSION, entries: {}, reviewedThrough: {} };
     }
     await this.prune();
   }
@@ -139,8 +149,28 @@ export class BaselineStore {
     await this.writeIndex();
   }
 
+  /** Newest Claude event (ms) already reviewed for this session; 0 = none. */
+  async reviewedThrough(sessionId: string): Promise<number> {
+    await this.initialize();
+    return this.index.reviewedThrough[sessionId] ?? 0;
+  }
+
+  async setReviewedThrough(sessionId: string, value: number): Promise<void> {
+    await this.initialize();
+    if ((this.index.reviewedThrough[sessionId] ?? 0) === value) {
+      return;
+    }
+    if (value <= 0) {
+      delete this.index.reviewedThrough[sessionId];
+    } else {
+      this.index.reviewedThrough[sessionId] = value;
+    }
+    await this.writeIndex();
+  }
+
   async deleteSession(sessionId: string): Promise<void> {
     await this.initialize();
+    delete this.index.reviewedThrough[sessionId];
     const keys = Object.entries(this.index.entries)
       .filter(([, entry]) => entry.sessionId === sessionId)
       .map(([key]) => key);

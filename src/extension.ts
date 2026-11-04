@@ -7,7 +7,9 @@ import {
   BaselineMode,
   buildFileChanges,
   FileChange,
-  LocalBaseline
+  latestClaudeEventTime,
+  LocalBaseline,
+  selectReviewChanges
 } from './core/changeBuilder';
 import {
   applyHunkToBaseline,
@@ -28,6 +30,11 @@ const DISCOVERY_INTERVAL_MS = 4000;
 const COMPLETION_FLASH_MS = 8000;
 /** Claude Code does not reliably write an end-of-turn marker, so treat a quiet transcript as "done for now". */
 const COMPLETION_QUIET_MS = 5000;
+/**
+ * A transcript backup event is written just before Claude touches the file, so
+ * give the write time to land before deciding that an event produced no diff.
+ */
+const CLAUDE_EVENT_SETTLE_MS = 5000;
 
 interface Settings {
   enabled: boolean;
@@ -116,6 +123,13 @@ export class ClaudeInlineDiffController implements vscode.Disposable {
 
   private discoveredSessions: SessionCandidate[] = [];
   private lastDiscoveryAt = 0;
+  /**
+   * Newest Claude transcript event (ms) already fully reviewed. A diff is only
+   * shown while the transcript holds an event newer than this watermark, so
+   * external edits (git reset --hard, other tools) never start a review by
+   * themselves.
+   */
+  private reviewedThrough = 0;
   private lastEndTurnTimestamp: string | undefined;
   private lastTranscriptActivityAt = 0;
   private completionNotified = true;
@@ -269,8 +283,9 @@ export class ClaudeInlineDiffController implements vscode.Disposable {
         }
         // Manual edits only belong to the review while this window still has
         // unreviewed Claude changes; once everything is reviewed, edits the
-        // user makes afterwards are not tracked.
-        if (event.document.isDirty && !this.hasPendingReview()) {
+        // user makes afterwards (including VS Code reloading a file the user
+        // changed outside the editor) are not tracked.
+        if (!this.hasPendingReview()) {
           return;
         }
         // Unsaved keystrokes are part of the review too: the diff reads the
@@ -329,6 +344,21 @@ export class ClaudeInlineDiffController implements vscode.Disposable {
    */
   private hasPendingReview(): boolean {
     return this.changes.length > 0;
+  }
+
+  /**
+   * Marks settled transcript events as reviewed. Called when the diff list is
+   * empty: the on-disk state and the accepted baseline agree, so any later
+   * change without a newer Claude event is not ours to review.
+   */
+  private async consumeClaudeActivity(settledEvent: number): Promise<void> {
+    if (settledEvent <= this.reviewedThrough) {
+      return;
+    }
+    this.reviewedThrough = settledEvent;
+    if (this.session) {
+      await this.baselineStore.setReviewedThrough(this.session.sessionId, settledEvent);
+    }
   }
 
   private scheduleRefresh(delay: number): void {
@@ -399,7 +429,14 @@ export class ClaudeInlineDiffController implements vscode.Disposable {
         this.lastTranscriptActivityAt = Date.now();
         this.completionNotified = firstUpdate;
       }
-      const shouldBuild = force || update.changed || this.workspaceDirty;
+      const transcript = parser.getState();
+      const latestEvent = latestClaudeEventTime(transcript);
+      const settledEvent = Math.min(latestEvent, Date.now() - CLAUDE_EVENT_SETTLE_MS);
+      // Settled Claude activity with an empty review still needs one rebuild to
+      // advance the watermark, otherwise a later external edit would look like
+      // a fresh Claude change.
+      const shouldSettle = this.changes.length === 0 && settledEvent > this.reviewedThrough;
+      const shouldBuild = force || update.changed || this.workspaceDirty || shouldSettle;
       this.workspaceDirty = false;
       if (!shouldBuild) {
         return;
@@ -415,7 +452,7 @@ export class ClaudeInlineDiffController implements vscode.Disposable {
         endTurn !== previousEndTurn;
 
       const sessionId = target.sessionId;
-      const changes = await buildFileChanges({
+      const built = await buildFileChanges({
         session: parser.getState(),
         sessionId,
         baselineMode: this.settings.baselineMode,
@@ -428,6 +465,12 @@ export class ClaudeInlineDiffController implements vscode.Disposable {
         log: (message) => logLine(this.output, message)
       });
 
+      // Only surface a review while Claude has an edit newer than the last
+      // fully reviewed state; then every diff is part of that review.
+      const changes = selectReviewChanges(built, this.reviewedThrough);
+      if (changes.length === 0) {
+        await this.consumeClaudeActivity(settledEvent);
+      }
       await this.applyChanges(changes);
       if (completedTurn && changes.length > 0) {
         this.startCompletionFlash(changes.length);
@@ -528,6 +571,7 @@ export class ClaudeInlineDiffController implements vscode.Disposable {
     this.suppressInitialCompletion = true;
     const entries = await this.baselineStore.entriesForSession(session.sessionId);
     this.localBaselines = new Map(entries.map((entry) => [pathKey(entry.path), entry]));
+    this.reviewedThrough = await this.baselineStore.reviewedThrough(session.sessionId);
     logLine(
       this.output,
       `会话 ${session.sessionId.slice(0, 8)} · ${session.cwd ?? session.projectDir} · ${entries.length} 个本地已审核基线`
@@ -586,6 +630,7 @@ export class ClaudeInlineDiffController implements vscode.Disposable {
     this.session = undefined;
     this.parser = undefined;
     this.localBaselines.clear();
+    this.reviewedThrough = 0;
     this.lastEndTurnTimestamp = undefined;
     this.changes = [];
     this.changesByKey.clear();
@@ -1008,6 +1053,7 @@ export class ClaudeInlineDiffController implements vscode.Disposable {
         await this.baselineStore.deleteSession(sessionId);
         if (this.session?.sessionId === sessionId) {
           this.localBaselines.clear();
+          this.reviewedThrough = 0;
         }
         await this.refresh(true);
       });
