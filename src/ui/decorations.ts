@@ -12,7 +12,6 @@ const ADDED_LINE_BG = '#39cc6533';
 const REMOVED_LINE_BG = '#e6454533';
 const ADDED_WORD_BG = '#39cc6566';
 const REMOVED_WORD_BG = '#e6454566';
-const ADDED_SOLID = '#39cc65';
 const REMOVED_SOLID = '#e64545';
 
 export interface DecorationContext {
@@ -94,29 +93,23 @@ export class DecorationManager implements vscode.Disposable {
   private readonly removedText: vscode.TextEditorDecorationType;
 
   constructor() {
-    // 不再在行号槽绘制红绿竖线，仅保留整行背景与概览标尺标记。
+    // 只在编辑区绘制整行背景，不在行号槽/概览标尺绘制红绿竖线。
     this.addedLine = vscode.window.createTextEditorDecorationType({
       isWholeLine: true,
-      backgroundColor: ADDED_LINE_BG,
-      overviewRulerColor: ADDED_SOLID,
-      overviewRulerLane: vscode.OverviewRulerLane.Left
+      backgroundColor: ADDED_LINE_BG
     });
     this.addedText = vscode.window.createTextEditorDecorationType({
       backgroundColor: ADDED_WORD_BG,
       borderRadius: '2px'
     });
-    // 源文件中的删除位置只在概览标尺留下标记，具体位置用行间小箭头表示。
-    this.removedAnchor = vscode.window.createTextEditorDecorationType({
-      overviewRulerColor: REMOVED_SOLID,
-      overviewRulerLane: vscode.OverviewRulerLane.Left
-    });
+    // 源文件中的删除位置用行间小箭头表示，不再在概览标尺留下竖线。
+    // 该类型仍用于承载删除接缝处的悬停提示。
+    this.removedAnchor = vscode.window.createTextEditorDecorationType({});
     // 删除接缝处的小箭头：贴在上一行行尾（上下文之间），不占用代码宽度。
     this.removedArrow = vscode.window.createTextEditorDecorationType({});
     this.removedLine = vscode.window.createTextEditorDecorationType({
       isWholeLine: true,
-      backgroundColor: REMOVED_LINE_BG,
-      overviewRulerColor: REMOVED_SOLID,
-      overviewRulerLane: vscode.OverviewRulerLane.Left
+      backgroundColor: REMOVED_LINE_BG
     });
     this.removedText = vscode.window.createTextEditorDecorationType({
       backgroundColor: REMOVED_WORD_BG,
