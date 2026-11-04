@@ -112,6 +112,12 @@ export class ClaudeInlineDiffController implements vscode.Disposable {
   private session: SessionCandidate | undefined;
   private parser: TranscriptParser | undefined;
   private localBaselines = new Map<string, LocalBaseline>();
+  /**
+   * Last content observed per path, fed back into the diff builder so a Claude
+   * checkpoint/rewind (content moving back to an earlier backup) can be told
+   * apart from a new edit instead of being recorded as a new change.
+   */
+  private readonly observedContents = new Map<string, string | null>();
   private changes: FileChange[] = [];
   private changesByKey = new Map<string, FileChange>();
   private pinnedSessionId: string | undefined;
@@ -462,12 +468,31 @@ export class ClaudeInlineDiffController implements vscode.Disposable {
         maxFileSizeBytes: this.settings.maxFileSizeBytes,
         readBackup: (backupFileName) => this.fileHistory.readBackup(sessionId, backupFileName),
         readCurrent: (fsPath) => this.readCurrent(fsPath),
+        observedContents: this.observedContents,
         log: (message) => logLine(this.output, message)
       });
 
+      // A rollback inside Claude restores files to earlier backups. That is
+      // Claude withdrawing its own work, so fold the restored content into the
+      // accepted baseline instead of reporting it as a brand-new change.
+      const restored = built.filter((change) => change.restoredFromBackup);
+      for (const change of restored) {
+        const text = change.currentMissing ? '' : change.currentText;
+        await this.baselineStore.set(change.sessionId, change.path, text);
+        this.rememberLocalBaseline(change, text);
+        logLine(
+          this.output,
+          `检测到 Claude 回滚 ${change.relativePath}，已撤回该文件的改动记录。`
+        );
+      }
+      const withdrawn = new Set(restored.map((change) => pathKey(change.path)));
+      const remaining = withdrawn.size === 0
+        ? built
+        : built.filter((change) => !withdrawn.has(pathKey(change.path)));
+
       // Only surface a review while Claude has an edit newer than the last
       // fully reviewed state; then every diff is part of that review.
-      const changes = selectReviewChanges(built, this.reviewedThrough);
+      const changes = selectReviewChanges(remaining, this.reviewedThrough);
       if (changes.length === 0) {
         await this.consumeClaudeActivity(settledEvent);
       }

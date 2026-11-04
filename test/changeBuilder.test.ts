@@ -207,6 +207,57 @@ test('files tracked only by a local baseline never start a review', async () => 
   assert.deepEqual(selectReviewChanges(changes, 0), []);
 });
 
+function restoreState(): TranscriptState {
+  const state = baseState();
+  state.deltas.push({
+    timestamp: '2025-01-01T00:05:00.000Z',
+    snapshotMessageId: 'prompt-1',
+    trackingPath: FILE,
+    backup: backup('v2@v1')
+  });
+  return state;
+}
+
+async function buildRestoreCase(
+  currentText: string,
+  observed?: Map<string, string | null>
+) {
+  return buildFileChanges({
+    session: restoreState(),
+    sessionId: 'session-1',
+    baselineMode: 'session',
+    localBaselines: new Map(),
+    workspaceRoots: [ROOT],
+    exclude: [],
+    maxFileSizeBytes: 1024 * 1024,
+    readBackup: async (name) =>
+      name === 'v1@v1' ? 'line1\nline2\n' : name === 'v2@v1' ? 'line1\nline2\nline3\n' : null,
+    readCurrent: async () => ({ text: currentText, missing: false }),
+    observedContents: observed
+  });
+}
+
+test('content restored to an earlier Claude backup is flagged as a rewind', async () => {
+  const observed = new Map<string, string | null>([[pathKey(FILE), 'line1\nline2\nline3\nline4\n']]);
+  const changes = await buildRestoreCase('line1\nline2\nline3\n', observed);
+  assert.equal(changes.length, 1);
+  assert.equal(changes[0].restoredFromBackup, true);
+  assert.equal(observed.get(pathKey(FILE)), 'line1\nline2\nline3\n');
+});
+
+test('a fresh edit writes content no backup contains and is not a rewind', async () => {
+  const observed = new Map<string, string | null>([[pathKey(FILE), 'line1\nline2\nline3\n']]);
+  const changes = await buildRestoreCase('line1\nline2\nfresh\n', observed);
+  assert.equal(changes.length, 1);
+  assert.equal(changes[0].restoredFromBackup, false);
+});
+
+test('the first observation never counts as a rewind', async () => {
+  const changes = await buildRestoreCase('line1\nline2\nline3\n', new Map());
+  assert.equal(changes.length, 1);
+  assert.equal(changes[0].restoredFromBackup, false);
+});
+
 test('review model maps merged lines back to source lines', async () => {
   const changes = await buildWith(baseState(), 'line1\nCHANGED\nline2\nline3\n');
   assert.equal(changes.length, 1);

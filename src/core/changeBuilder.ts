@@ -28,6 +28,13 @@ export interface FileChange {
    * or 0 when the path only exists because of a stored local baseline.
    */
   lastClaudeEventAt: number;
+  /**
+   * True when the file content moved, since the caller last observed it, to a
+   * state Claude had previously recorded (a checkpoint/rewind restore) rather
+   * than to a new edit. Such a change is Claude withdrawing its own work, so it
+   * must not be surfaced as a new review.
+   */
+  restoredFromBackup: boolean;
 }
 
 export interface LocalBaseline {
@@ -45,6 +52,12 @@ export interface BuildChangesInput {
   maxFileSizeBytes: number;
   readBackup: (backupFileName: string) => Promise<string | null>;
   readCurrent: (fsPath: string) => Promise<{ text: string; missing: boolean; tooLarge?: boolean }>;
+  /**
+   * Last content the caller observed per path (null means the file was
+   * missing). Mutated in place on every build so the next one can tell a new
+   * Claude edit apart from a rewind to previously recorded content.
+   */
+  observedContents?: Map<string, string | null>;
   log?: (message: string) => void;
 }
 
@@ -171,6 +184,39 @@ async function readBaselineForEvent(
   return text === null ? undefined : { text, existed: true };
 }
 
+/**
+ * True when the current state of the file matches content Claude recorded in
+ * one of its own backup events (or "did not exist", for a null backup). This
+ * is the signature of a checkpoint/rewind restoring an older snapshot: a fresh
+ * edit writes content that no backup contains yet.
+ */
+async function matchesRecordedBackup(
+  candidate: PathCandidate,
+  currentMissing: boolean,
+  currentText: string,
+  readBackup: (backupFileName: string) => Promise<string | null>
+): Promise<boolean> {
+  const checked = new Set<string>();
+  for (const event of candidate.events) {
+    const backupFileName = event.backup.backupFileName;
+    if (backupFileName === null) {
+      if (currentMissing) {
+        return true;
+      }
+      continue;
+    }
+    if (currentMissing || checked.has(backupFileName)) {
+      continue;
+    }
+    checked.add(backupFileName);
+    const text = await readBackup(backupFileName);
+    if (text !== null && stripBom(text) === currentText) {
+      return true;
+    }
+  }
+  return false;
+}
+
 async function resolveTranscriptBaseline(
   candidate: PathCandidate,
   input: BuildChangesInput
@@ -271,6 +317,19 @@ export async function buildFileChanges(input: BuildChangesInput): Promise<FileCh
       continue;
     }
 
+    // Track the content we observe so a later build can tell a normal new
+    // Claude edit from a rewind back to previously recorded content. Only a
+    // path we already observed changing qualifies: the very first build, or a
+    // turn-start snapshot whose backup equals the current file, must not look
+    // like a restore.
+    const observedValue = current.missing ? null : cleanCurrent;
+    const previousValue = input.observedContents?.get(key);
+    const contentMoved = previousValue !== undefined && previousValue !== observedValue;
+    input.observedContents?.set(key, observedValue);
+    const restoredFromBackup =
+      contentMoved &&
+      (await matchesRecordedBackup(candidate, current.missing, cleanCurrent, input.readBackup));
+
     const baselineSplit = splitText(cleanBaseline);
     const currentSplit = splitText(cleanCurrent);
     const diff = computeLineDiff(baselineSplit.lines, currentSplit.lines);
@@ -291,7 +350,8 @@ export async function buildFileChanges(input: BuildChangesInput): Promise<FileCh
       diff,
       addedCount: diff.addedCount,
       removedCount: diff.removedCount,
-      lastClaudeEventAt: parseTimestamp(candidate.events[candidate.events.length - 1]?.timestamp)
+      lastClaudeEventAt: parseTimestamp(candidate.events[candidate.events.length - 1]?.timestamp),
+      restoredFromBackup
     });
   }
 
