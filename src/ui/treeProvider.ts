@@ -89,9 +89,13 @@ export class ChangesTreeProvider implements vscode.TreeDataProvider<ChangeNode>,
     item.id = `file:${pathKey(change.path)}`;
     item.resourceUri = vscode.Uri.file(change.path);
     item.contextValue = 'claudeChangeFile';
-    item.description = `+${change.addedCount} −${change.removedCount}`;
+    item.description = `+${change.addedCount} −${change.removedCount}${
+      change.outsideWorkspace ? ' · 工作区外' : ''
+    }`;
     item.tooltip = new vscode.MarkdownString(
-      `**${change.relativePath}**\n\n${change.diff.hunks.length} 处未审核改动 · 新增 ${change.addedCount} 行 · 删除 ${change.removedCount} 行\n\n点击打开单栏内联审查视图。`
+      `**${change.relativePath}**\n\n${change.diff.hunks.length} 处未审核改动 · 新增 ${change.addedCount} 行 · 删除 ${change.removedCount} 行` +
+        (change.outsideWorkspace ? '\n\n该文件不在当前工作区内。' : '') +
+        '\n\n点击打开单栏内联审查视图。'
     );
     item.command = {
       command: 'claudeInlineDiff.openReview',

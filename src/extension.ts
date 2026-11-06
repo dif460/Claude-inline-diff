@@ -1,6 +1,7 @@
 import * as fs from 'fs';
 import * as vscode from 'vscode';
 import { FileHistoryReader } from './claude/fileHistory';
+import { getClaudeHome, isPathInside } from './claude/paths';
 import { discoverSessions, SessionCandidate } from './claude/sessions';
 import { TranscriptParser } from './claude/transcript';
 import {
@@ -25,9 +26,25 @@ import { ChangesTreeProvider } from './ui/treeProvider';
 import type { ChangeNode } from './ui/treeProvider';
 
 const PINNED_SESSION_KEY = 'claudeInlineDiff.pinnedSessionId';
+/** Fallback poll. Real-time detection comes from the fs.watch on the transcript. */
 const POLL_INTERVAL_MS = 2000;
 const DISCOVERY_INTERVAL_MS = 4000;
 const COMPLETION_FLASH_MS = 8000;
+/**
+ * How long after the transcript was last appended Claude still counts as
+ * "working". During that window changes seen on disk are attributed to Claude,
+ * which covers edits made through shell commands or scripts that never write a
+ * file-history event of their own.
+ */
+const CLAUDE_ACTIVITY_WINDOW_MS = 5 * 60_000;
+/** How long a manual edit is remembered so it is never attributed to Claude. */
+const USER_EDIT_MEMORY_MS = 30 * 60_000;
+/**
+ * The target file is written a moment after Claude records the edit, so the
+ * transcript signal can arrive before the new content is on disk. Re-check
+ * shortly afterwards instead of waiting for the next poll.
+ */
+const ACTIVITY_FOLLOW_UP_MS = [250, 700];
 /** Claude Code does not reliably write an end-of-turn marker, so treat a quiet transcript as "done for now". */
 const COMPLETION_QUIET_MS = 5000;
 /**
@@ -138,6 +155,15 @@ export class ClaudeInlineDiffController implements vscode.Disposable {
   private reviewedThrough = 0;
   private lastEndTurnTimestamp: string | undefined;
   private lastTranscriptActivityAt = 0;
+  /**
+   * Wall-clock time of the last accepted/reviewed state. Changes observed on
+   * disk after it count as part of the pending review.
+   */
+  private lastAcceptedAt = 0;
+  /** Last time the user edited each file in this window; such edits are never attributed to Claude. */
+  private readonly userEdits = new Map<string, number>();
+  /** Start of the previous build, used to tell a user edit from a Claude edit. */
+  private lastBuildAt = 0;
   private completionNotified = true;
   private suppressInitialCompletion = false;
   private workspaceDirty = false;
@@ -148,6 +174,9 @@ export class ClaudeInlineDiffController implements vscode.Disposable {
   private pollTimer: ReturnType<typeof setInterval> | undefined;
   private refreshTimer: ReturnType<typeof setTimeout> | undefined;
   private completionTimer: ReturnType<typeof setTimeout> | undefined;
+  private transcriptWatcher: fs.FSWatcher | undefined;
+  /** One debounced follow-up refresh per delay in ACTIVITY_FOLLOW_UP_MS. */
+  private activityTimers = new Map<number, ReturnType<typeof setTimeout>>();
   private completionFlashUntil = 0;
   private acceptQueue: Promise<void> = Promise.resolve();
 
@@ -287,6 +316,7 @@ export class ClaudeInlineDiffController implements vscode.Disposable {
         if (event.contentChanges.length === 0) {
           return;
         }
+        this.noteUserEdit(event.document.uri.fsPath);
         // Manual edits only belong to the review while this window still has
         // unreviewed Claude changes; once everything is reviewed, edits the
         // user makes afterwards (including VS Code reloading a file the user
@@ -300,7 +330,11 @@ export class ClaudeInlineDiffController implements vscode.Disposable {
         this.scheduleRefresh(event.document.isDirty ? 400 : 500);
       }),
       vscode.workspace.onDidSaveTextDocument((document) => {
-        if (document.uri.scheme === 'file' && this.hasPendingReview()) {
+        if (document.uri.scheme !== 'file') {
+          return;
+        }
+        this.noteUserEdit(document.uri.fsPath);
+        if (this.hasPendingReview()) {
           this.workspaceDirty = true;
           this.scheduleRefresh(200);
         }
@@ -332,16 +366,76 @@ export class ClaudeInlineDiffController implements vscode.Disposable {
 
   private createFileWatcherDisposables(): vscode.Disposable[] {
     const watcher = vscode.workspace.createFileSystemWatcher('**/*');
-    const refresh = (): void => {
-      // Same rule as editor edits: manual file-level changes (Explorer, git,
-      // another tool) only count while a Claude change is still unreviewed.
-      if (!this.hasPendingReview()) {
+    const claudeHome = getClaudeHome();
+    const refresh = (uri: vscode.Uri): void => {
+      // Claude's own storage (transcripts, backups) lives outside the review.
+      if (uri && isPathInside(claudeHome, uri.fsPath)) {
+        return;
+      }
+      // Manual file-level changes (Explorer, git, another tool) only count
+      // while a Claude change is still unreviewed, or while Claude itself is
+      // working — that covers edits made through shell commands, which never
+      // produce a file-history event.
+      if (!this.hasPendingReview() && !this.isClaudeActive()) {
         return;
       }
       this.workspaceDirty = true;
-      this.scheduleRefresh(300);
+      // Keep a fixed cadence instead of resetting the timer on every event, so
+      // a long burst of writes (install, codegen) cannot starve the refresh.
+      this.scheduleRefreshIfIdle(250);
     };
     return [watcher, watcher.onDidCreate(refresh), watcher.onDidDelete(refresh), watcher.onDidChange(refresh)];
+  }
+
+  /**
+   * Watches the transcript itself so a Claude edit is picked up in tens of
+   * milliseconds instead of on the next poll. The poll stays as a fallback for
+   * platforms where fs.watch on a single file is unreliable.
+   */
+  private watchTranscript(filePath: string): void {
+    this.unwatchTranscript();
+    try {
+      this.transcriptWatcher = fs.watch(filePath, () => this.onTranscriptTouched());
+      this.transcriptWatcher.on('error', () => this.unwatchTranscript());
+    } catch {
+      this.transcriptWatcher = undefined;
+    }
+  }
+
+  private unwatchTranscript(): void {
+    if (this.transcriptWatcher) {
+      this.transcriptWatcher.close();
+      this.transcriptWatcher = undefined;
+    }
+  }
+
+  private onTranscriptTouched(): void {
+    if (this.disposed) {
+      return;
+    }
+    this.lastTranscriptActivityAt = Date.now();
+    this.scheduleRefreshIfIdle(60);
+    for (const delay of ACTIVITY_FOLLOW_UP_MS) {
+      const existing = this.activityTimers.get(delay);
+      if (existing) {
+        clearTimeout(existing);
+      }
+      const timer = setTimeout(() => {
+        this.activityTimers.delete(delay);
+        if (!this.disposed) {
+          this.scheduleRefreshIfIdle(0);
+        }
+      }, delay);
+      this.activityTimers.set(delay, timer);
+    }
+  }
+
+  /** True while Claude's transcript shows it has been working recently. */
+  private isClaudeActive(): boolean {
+    return (
+      this.lastTranscriptActivityAt > 0 &&
+      Date.now() - this.lastTranscriptActivityAt < CLAUDE_ACTIVITY_WINDOW_MS
+    );
   }
 
   /**
@@ -350,6 +444,36 @@ export class ClaudeInlineDiffController implements vscode.Disposable {
    */
   private hasPendingReview(): boolean {
     return this.changes.length > 0;
+  }
+
+  /**
+   * Files whose content moved on disk after the last accepted state only count
+   * while Claude is actively working, so external tools (git, formatters) never
+   * start a review on their own.
+   */
+  private observedSince(): number {
+    if (this.isClaudeActive() && this.lastTranscriptActivityAt > this.lastAcceptedAt) {
+      return this.lastAcceptedAt;
+    }
+    return Number.POSITIVE_INFINITY;
+  }
+
+  private noteUserEdit(fsPath: string): void {
+    const now = Date.now();
+    this.userEdits.set(pathKey(fsPath), now);
+    if (this.userEdits.size > 200) {
+      for (const [key, at] of this.userEdits) {
+        if (now - at > USER_EDIT_MEMORY_MS) {
+          this.userEdits.delete(key);
+        }
+      }
+    }
+  }
+
+  /** True when the last thing that touched this file was the user in this window. */
+  private isUserEdit(change: FileChange): boolean {
+    const at = this.userEdits.get(pathKey(change.path)) ?? 0;
+    return at > this.lastBuildAt;
   }
 
   /**
@@ -362,9 +486,18 @@ export class ClaudeInlineDiffController implements vscode.Disposable {
       return;
     }
     this.reviewedThrough = settledEvent;
+    this.lastAcceptedAt = Date.now();
     if (this.session) {
       await this.baselineStore.setReviewedThrough(this.session.sessionId, settledEvent);
     }
+  }
+
+  /** Schedules a refresh unless one is already queued, so bursts keep a cadence. */
+  private scheduleRefreshIfIdle(delay: number): void {
+    if (this.disposed || this.refreshTimer) {
+      return;
+    }
+    this.scheduleRefresh(delay);
   }
 
   private scheduleRefresh(delay: number): void {
@@ -431,7 +564,7 @@ export class ClaudeInlineDiffController implements vscode.Disposable {
       const update = await parser.update();
       const firstUpdate = this.suppressInitialCompletion;
       this.suppressInitialCompletion = false;
-      if (update.changed) {
+      if (update.changed || update.grew) {
         this.lastTranscriptActivityAt = Date.now();
         this.completionNotified = firstUpdate;
       }
@@ -491,8 +624,20 @@ export class ClaudeInlineDiffController implements vscode.Disposable {
         : built.filter((change) => !withdrawn.has(pathKey(change.path)));
 
       // Only surface a review while Claude has an edit newer than the last
-      // fully reviewed state; then every diff is part of that review.
-      const changes = selectReviewChanges(remaining, this.reviewedThrough);
+      // fully reviewed state; then every diff is part of that review. Edits
+      // that never produce a file-history event (shell commands, codegen) open
+      // the review through the on-disk observation, unless the user made that
+      // particular edit in this window.
+      const observedSince = this.observedSince();
+      const openedByDiskChange = remaining.some(
+        (change) => change.observedChangeAt > observedSince && !this.isUserEdit(change)
+      );
+      const changes = selectReviewChanges(
+        remaining,
+        this.reviewedThrough,
+        openedByDiskChange ? observedSince : Number.POSITIVE_INFINITY
+      );
+      this.lastBuildAt = Date.now();
       if (changes.length === 0) {
         await this.consumeClaudeActivity(settledEvent);
       }
@@ -589,9 +734,12 @@ export class ClaudeInlineDiffController implements vscode.Disposable {
   private async activateSession(session: SessionCandidate): Promise<void> {
     this.session = session;
     this.parser = new TranscriptParser(session.filePath);
+    this.watchTranscript(session.filePath);
     this.fileHistory.clear();
     this.lastEndTurnTimestamp = undefined;
     this.lastTranscriptActivityAt = 0;
+    this.lastAcceptedAt = 0;
+    this.lastBuildAt = 0;
     this.completionNotified = true;
     this.suppressInitialCompletion = true;
     const entries = await this.baselineStore.entriesForSession(session.sessionId);
@@ -652,10 +800,13 @@ export class ClaudeInlineDiffController implements vscode.Disposable {
     if (!this.session && this.changes.length === 0 && this.discoveredSessions.length === 0) {
       return;
     }
+    this.unwatchTranscript();
     this.session = undefined;
     this.parser = undefined;
     this.localBaselines.clear();
     this.reviewedThrough = 0;
+    this.lastAcceptedAt = 0;
+    this.lastBuildAt = 0;
     this.lastEndTurnTimestamp = undefined;
     this.changes = [];
     this.changesByKey.clear();
@@ -833,6 +984,7 @@ export class ClaudeInlineDiffController implements vscode.Disposable {
         const text = joinLines(updated, currentSplit.eol, currentSplit.finalNewline);
         await this.baselineStore.set(change.sessionId, change.path, text);
         this.rememberLocalBaseline(change, text);
+        this.lastAcceptedAt = Date.now();
         await this.refresh(true);
       });
       void vscode.window.setStatusBarMessage('已标记 1 处改动为已审核', 2000);
@@ -859,6 +1011,7 @@ export class ClaudeInlineDiffController implements vscode.Disposable {
         const text = change.currentMissing ? '' : change.currentText;
         await this.baselineStore.set(change.sessionId, change.path, text);
         this.rememberLocalBaseline(change, text);
+        this.lastAcceptedAt = Date.now();
         await this.refresh(true);
       });
       void vscode.window.setStatusBarMessage('已标记该文件的全部改动为已审核', 2000);
@@ -881,6 +1034,7 @@ export class ClaudeInlineDiffController implements vscode.Disposable {
           await this.baselineStore.set(change.sessionId, change.path, text);
           this.rememberLocalBaseline(change, text);
         }
+        this.lastAcceptedAt = Date.now();
         await this.refresh(true);
       });
       void vscode.window.setStatusBarMessage(
@@ -953,7 +1107,8 @@ export class ClaudeInlineDiffController implements vscode.Disposable {
     }
     const confirmed = await this.confirmReject(
       `将把 ${change.relativePath} 第 ${hunk.currentStart + 1} 行处的改动还原为 Claude 修改前的内容，` +
-        '这会直接修改工作区文件。'
+        '这会直接修改文件。' +
+        (change.outsideWorkspace ? '（该文件不在当前工作区内）' : '')
     );
     if (!confirmed) {
       return;
@@ -971,6 +1126,7 @@ export class ClaudeInlineDiffController implements vscode.Disposable {
           const finalNewline = change.currentMissing ? true : currentSplit.finalNewline;
           await this.writeFileContent(change.path, joinLines(lines, eol, finalNewline));
         }
+        this.lastAcceptedAt = Date.now();
         await this.refresh(true);
       });
       void vscode.window.setStatusBarMessage('已还原 1 处改动', 2000);
@@ -996,10 +1152,11 @@ export class ClaudeInlineDiffController implements vscode.Disposable {
       void vscode.window.showWarningMessage('该文件有未保存的修改，请先保存后再拒绝。');
       return;
     }
+    const outside = change.outsideWorkspace ? '（该文件不在当前工作区内）' : '';
     const confirmed = await this.confirmReject(
       change.baselineExisted
-        ? `将把 ${change.relativePath} 还原到 Claude 修改前的内容，这会直接覆盖工作区文件。`
-        : `这个文件是 Claude 新建的，拒绝改动会把 ${change.relativePath} 删除。`
+        ? `将把 ${change.relativePath} 还原到 Claude 修改前的内容，这会直接覆盖文件。${outside}`
+        : `这个文件是 Claude 新建的，拒绝改动会把 ${change.relativePath} 删除。${outside}`
     );
     if (!confirmed) {
       return;
@@ -1011,6 +1168,7 @@ export class ClaudeInlineDiffController implements vscode.Disposable {
         } else {
           await this.deleteFileContent(change.path);
         }
+        this.lastAcceptedAt = Date.now();
         await this.refresh(true);
       });
       void vscode.window.setStatusBarMessage('已还原该文件的改动', 2000);
@@ -1054,6 +1212,7 @@ export class ClaudeInlineDiffController implements vscode.Disposable {
             failed.push(change.relativePath);
           }
         }
+        this.lastAcceptedAt = Date.now();
         await this.refresh(true);
       });
       if (failed.length > 0) {
@@ -1079,6 +1238,7 @@ export class ClaudeInlineDiffController implements vscode.Disposable {
         if (this.session?.sessionId === sessionId) {
           this.localBaselines.clear();
           this.reviewedThrough = 0;
+          this.lastAcceptedAt = 0;
         }
         await this.refresh(true);
       });
@@ -1211,6 +1371,11 @@ export class ClaudeInlineDiffController implements vscode.Disposable {
       return;
     }
     this.disposed = true;
+    this.unwatchTranscript();
+    for (const timer of this.activityTimers.values()) {
+      clearTimeout(timer);
+    }
+    this.activityTimers.clear();
     if (this.pollTimer) {
       clearInterval(this.pollTimer);
       this.pollTimer = undefined;

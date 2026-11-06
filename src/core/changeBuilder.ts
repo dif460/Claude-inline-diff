@@ -1,3 +1,4 @@
+import * as os from 'os';
 import * as path from 'path';
 import { minimatch } from 'minimatch';
 import { computeLineDiff, DiffHunk, LineDiffResult } from './lineDiff';
@@ -10,9 +11,15 @@ export type BaselineMode = 'session' | 'turn';
 export interface FileChange {
   /** Absolute file path as recorded by Claude (or by the workspace for local baselines). */
   path: string;
-  /** Absolute workspace-relative path with forward slashes. */
+  /**
+   * Display path with forward slashes: workspace-relative when the file lives
+   * inside a workspace folder, otherwise an absolute (or `~`-shortened) path.
+   */
   relativePath: string;
+  /** Workspace folder this change belongs to; empty for files outside every folder. */
   root: string;
+  /** True when the file lies outside every workspace folder. */
+  outsideWorkspace: boolean;
   sessionId: string;
   baselineText: string;
   /** False when Claude created the file: rejecting the change deletes it. */
@@ -35,6 +42,13 @@ export interface FileChange {
    * must not be surfaced as a new review.
    */
   restoredFromBackup: boolean;
+  /**
+   * Wall-clock time (ms) of the build that first saw this file's content move
+   * away from the previous observation, or 0 when it had already settled.
+   * This lets edits Claude makes without a file-history event (shell commands,
+   * scripts, codegen) surface as soon as they land on disk.
+   */
+  observedChangeAt: number;
 }
 
 export interface LocalBaseline {
@@ -75,9 +89,30 @@ interface PathCandidate {
 interface WorkspaceLocation {
   root: string;
   relativePath: string;
+  /** True when no workspace folder contains the file. */
+  outside: boolean;
 }
 
-function workspaceLocation(fsPath: string, workspaceRoots: string[]): WorkspaceLocation | undefined {
+/** Absolute path with `~` substituted for the home directory, forward slashes. */
+function displayPathOutsideWorkspace(fsPath: string): string {
+  const resolved = slashPath(path.resolve(fsPath));
+  const home = slashPath(path.resolve(os.homedir()));
+  const comparable = process.platform === 'win32' ? resolved.toLowerCase() : resolved;
+  const comparableHome = process.platform === 'win32' ? home.toLowerCase() : home;
+  if (comparable === comparableHome) {
+    return '~';
+  }
+  if (comparable.startsWith(`${comparableHome}/`)) {
+    return `~${resolved.slice(home.length)}`;
+  }
+  return resolved;
+}
+
+/**
+ * Files Claude edits outside the open workspace are still reviewed: they keep
+ * their absolute (or `~`-relative) path so they are unambiguous in the tree.
+ */
+function workspaceLocation(fsPath: string, workspaceRoots: string[]): WorkspaceLocation {
   let best: WorkspaceLocation | undefined;
   for (const root of workspaceRoots) {
     if (!isPathInside(root, fsPath)) {
@@ -85,10 +120,10 @@ function workspaceLocation(fsPath: string, workspaceRoots: string[]): WorkspaceL
     }
     const relativePath = slashPath(path.relative(root, fsPath));
     if (best === undefined || root.length > best.root.length) {
-      best = { root, relativePath };
+      best = { root, relativePath, outside: false };
     }
   }
-  return best;
+  return best ?? { root: '', relativePath: displayPathOutsideWorkspace(fsPath), outside: true };
 }
 
 function isExcluded(relativePath: string, patterns: string[]): boolean {
@@ -126,9 +161,22 @@ export function latestClaudeEventTime(session: Readonly<TranscriptState>): numbe
  * that is newer than the last fully reviewed state. While such a change is
  * pending every diff is shown (including manual/git edits), because they are
  * part of what the user is reviewing; with nothing pending no diff is shown.
+ *
+ * `observedSince` is a wall-clock watermark (ms) for edits that produce no
+ * file-history event of their own (shell commands, codegen). A file whose
+ * content moved after that moment also opens the review; pass
+ * `Number.POSITIVE_INFINITY` to switch that fallback off.
  */
-export function selectReviewChanges(changes: FileChange[], reviewedThrough: number): FileChange[] {
-  return changes.some((change) => change.lastClaudeEventAt > reviewedThrough) ? changes : [];
+export function selectReviewChanges(
+  changes: FileChange[],
+  reviewedThrough: number,
+  observedSince = Number.POSITIVE_INFINITY
+): FileChange[] {
+  return changes.some(
+    (change) => change.lastClaudeEventAt > reviewedThrough || change.observedChangeAt > observedSince
+  )
+    ? changes
+    : [];
 }
 
 function compareEvents(a: BackupEvent, b: BackupEvent): number {
@@ -295,10 +343,12 @@ export async function buildFileChanges(input: BuildChangesInput): Promise<FileCh
     const baselineText = baseline.text;
 
     const location = workspaceLocation(candidate.displayPath, input.workspaceRoots);
-    if (!location) {
-      continue;
-    }
-    if (isExcluded(location.relativePath, input.exclude)) {
+    // Workspace patterns are relative to a folder; for outside files match the
+    // absolute path instead, so `**/node_modules/**`-style entries still apply.
+    const excludeTarget = location.outside
+      ? slashPath(path.resolve(candidate.displayPath))
+      : location.relativePath;
+    if (isExcluded(excludeTarget, input.exclude)) {
       continue;
     }
 
@@ -341,6 +391,7 @@ export async function buildFileChanges(input: BuildChangesInput): Promise<FileCh
       path: candidate.displayPath,
       relativePath: location.relativePath,
       root: location.root,
+      outsideWorkspace: location.outside,
       sessionId: input.sessionId,
       baselineText: cleanBaseline,
       baselineExisted: baseline.existed,
@@ -351,7 +402,8 @@ export async function buildFileChanges(input: BuildChangesInput): Promise<FileCh
       addedCount: diff.addedCount,
       removedCount: diff.removedCount,
       lastClaudeEventAt: parseTimestamp(candidate.events[candidate.events.length - 1]?.timestamp),
-      restoredFromBackup
+      restoredFromBackup,
+      observedChangeAt: contentMoved ? Date.now() : 0
     });
   }
 

@@ -38,6 +38,12 @@ export interface TranscriptState {
 
 export interface TranscriptUpdate {
   changed: boolean;
+  /**
+   * True when bytes were appended since the previous update, even if none of
+   * the lines we track were found. It tells the caller Claude is actively
+   * working, which is the signal used to start watching files on disk.
+   */
+  grew: boolean;
   reset: boolean;
 }
 
@@ -153,11 +159,12 @@ export class TranscriptParser {
     try {
       stat = await fs.promises.stat(this.filePath);
     } catch {
-      return { changed: false, reset: false };
+      return { changed: false, grew: false, reset: false };
     }
     if (stat.size === this.lastSize && stat.mtimeMs === this.lastMtimeMs) {
-      return { changed: false, reset: false };
+      return { changed: false, grew: false, reset: false };
     }
+    const grew = stat.size > this.lastSize;
     this.lastSize = stat.size;
     this.lastMtimeMs = stat.mtimeMs;
 
@@ -174,7 +181,7 @@ export class TranscriptParser {
 
     const start = this.parsedBytes;
     if (stat.size <= start) {
-      return { changed: reset, reset };
+      return { changed: reset, grew, reset };
     }
 
     // Read only the appended bytes. A partially written trailing line is left
@@ -188,7 +195,7 @@ export class TranscriptParser {
       handle = await fs.promises.open(this.filePath, 'r');
       bytesRead = (await handle.read(buffer, 0, length, start)).bytesRead;
     } catch {
-      return { changed: false, reset: false };
+      return { changed: false, grew: false, reset: false };
     } finally {
       await handle?.close().catch(() => undefined);
     }
@@ -196,7 +203,7 @@ export class TranscriptParser {
     const chunk = buffer.subarray(0, bytesRead);
     const lastNewline = chunk.lastIndexOf(0x0a);
     if (lastNewline < 0) {
-      return { changed: reset, reset };
+      return { changed: reset, grew, reset };
     }
     const completeText = chunk.subarray(0, lastNewline + 1).toString('utf8');
     let changed = false;
@@ -209,7 +216,7 @@ export class TranscriptParser {
       }
     }
     this.parsedBytes = start + lastNewline + 1;
-    return { changed: changed || reset, reset };
+    return { changed: changed || reset, grew, reset };
   }
 
   private consumeLine(line: string): boolean {

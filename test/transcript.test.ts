@@ -147,6 +147,30 @@ test('resolves relative tracking paths against realParentDir', async () => {
   }
 });
 
+test('reports growth even when the appended lines are not tracked', async () => {
+  const dir = await fs.promises.mkdtemp(path.join(os.tmpdir(), 'claude-inline-transcript-'));
+  const filePath = path.join(dir, 'session-1.jsonl');
+  await fs.promises.writeFile(filePath, sampleTranscript(), 'utf8');
+  try {
+    const parser = new TranscriptParser(filePath);
+    await parser.update();
+    await fs.promises.appendFile(
+      filePath,
+      line({
+        type: 'assistant',
+        timestamp: '2025-01-01T00:00:07.000Z',
+        message: { role: 'assistant', content: [{ type: 'text', text: 'hello' }] }
+      }),
+      'utf8'
+    );
+    const update = await parser.update();
+    assert.equal(update.changed, false);
+    assert.equal(update.grew, true);
+  } finally {
+    await fs.promises.rm(dir, { recursive: true, force: true });
+  }
+});
+
 test('resets state when the transcript is replaced by a shorter file', async () => {
   const dir = await fs.promises.mkdtemp(path.join(os.tmpdir(), 'claude-inline-transcript-'));
   const filePath = path.join(dir, 'session-1.jsonl');

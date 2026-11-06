@@ -2,7 +2,7 @@
   "name": "claude-inlineDiff",
   "displayName": "claude-inlineDiff",
   "description": "在真实编辑器内高亮 Claude Code 的改动，并提供 Trae 式逐块审核流程（单栏内联审查，无 Split Diff）。",
-  "version": "0.1.3",
+  "version": "0.1.5",
   "publisher": "Amireux",
   "private": true,
   "license": "MIT",
@@ -151,7 +151,7 @@
             "**/*.min.js",
             "**/*.map"
           ],
-          "description": "不参与审查工作区的 glob 模式（相对于工作区根目录）。"
+          "description": "不参与审查的 glob 模式。工作区内的文件相对于工作区根目录匹配；工作区外的文件按绝对路径匹配。"
         },
         "claudeInlineDiff.showCompletionStatus": {
           "type": "boolean",

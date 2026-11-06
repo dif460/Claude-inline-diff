@@ -258,6 +258,96 @@ test('the first observation never counts as a rewind', async () => {
   assert.equal(changes[0].restoredFromBackup, false);
 });
 
+/** An absolute path guaranteed to be outside both the workspace and home. */
+const OUTSIDE_BASE = process.platform === 'win32' ? 'C:\\claude-inline-outside' : '/claude-inline-outside';
+
+test('files outside the workspace are reported instead of being dropped', async () => {
+  const outside = path.join(OUTSIDE_BASE, 'notes', 'b.ts');
+  const state = baseState();
+  state.snapshots.set(
+    'prompt-1',
+    snapshot('prompt-1', '2025-01-01T00:00:00.000Z', [[outside, backup('v1@v1')]])
+  );
+  const changes = await buildWith(state, 'line1\nline2\nline3\n');
+  assert.equal(changes.length, 1);
+  assert.equal(changes[0].path, outside);
+  assert.equal(changes[0].outsideWorkspace, true);
+  assert.equal(changes[0].root, '');
+  assert.equal(changes[0].relativePath, outside.replace(/\\/g, '/'));
+});
+
+test('workspace files are still flagged as inside the workspace', async () => {
+  const changes = await buildWith(baseState(), 'line1\nline2\nline3\n');
+  assert.equal(changes[0].outsideWorkspace, false);
+});
+
+test('exclude patterns also apply to files outside the workspace', async () => {
+  const outside = path.join(OUTSIDE_BASE, 'node_modules', 'b.js');
+  const state = baseState();
+  state.snapshots.set(
+    'prompt-1',
+    snapshot('prompt-1', '2025-01-01T00:00:00.000Z', [[outside, backup('v1@v1')]])
+  );
+  const changes = await buildWith(state, 'line1\nline2\nline3\n', { exclude: ['**/node_modules/**'] });
+  assert.equal(changes.length, 0);
+});
+
+function observedState(): TranscriptState {
+  const state = baseState();
+  state.deltas.push({
+    timestamp: '2025-01-01T00:05:00.000Z',
+    snapshotMessageId: 'prompt-1',
+    trackingPath: FILE,
+    backup: backup('v1@v1')
+  });
+  return state;
+}
+
+async function buildObserved(observed: Map<string, string | null>) {
+  return buildFileChanges({
+    session: observedState(),
+    sessionId: 'session-1',
+    baselineMode: 'session',
+    localBaselines: new Map(),
+    workspaceRoots: [ROOT],
+    exclude: [],
+    maxFileSizeBytes: 1024 * 1024,
+    readBackup: async (name) => (name === 'v1@v1' ? 'line1\nline2\n' : null),
+    readCurrent: async () => ({ text: 'line1\nline2\nline3\n', missing: false }),
+    observedContents: observed
+  });
+}
+
+test('content that moved on disk records when it was first seen', async () => {
+  const observed = new Map<string, string | null>([[pathKey(FILE), 'line1\nline2\n']]);
+  const changes = await buildObserved(observed);
+  assert.equal(changes.length, 1);
+  assert.ok(changes[0].observedChangeAt > 0);
+});
+
+test('stable content carries no observed-change timestamp', async () => {
+  const observed = new Map<string, string | null>([[pathKey(FILE), 'line1\nline2\nline3\n']]);
+  const changes = await buildObserved(observed);
+  assert.equal(changes[0].observedChangeAt, 0);
+});
+
+test('a disk-only edit opens the review when observed after the accepted watermark', async () => {
+  const observed = new Map<string, string | null>([[pathKey(FILE), 'line1\nline2\n']]);
+  const changes = await buildObserved(observed);
+  const reviewedThrough = latestClaudeEventTime(observedState());
+  // No Claude file-history event is newer, but the content moved after the
+  // last accepted state, so the review still opens.
+  assert.equal(selectReviewChanges(changes, reviewedThrough).length, 0);
+  assert.equal(
+    selectReviewChanges(changes, reviewedThrough, changes[0].observedChangeAt - 1).length,
+    1
+  );
+  assert.equal(
+    selectReviewChanges(changes, reviewedThrough, changes[0].observedChangeAt).length,
+    0
+  );
+});
+
 test('review model maps merged lines back to source lines', async () => {
   const changes = await buildWith(baseState(), 'line1\nCHANGED\nline2\nline3\n');
   assert.equal(changes.length, 1);
