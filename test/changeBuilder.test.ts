@@ -331,6 +331,86 @@ test('stable content carries no observed-change timestamp', async () => {
   assert.equal(changes[0].observedChangeAt, 0);
 });
 
+function buildDiskChange(
+  currentText: string,
+  observed: Map<string, string | null>,
+  diskChangeAt?: Map<string, number>,
+  skipped?: Map<string, string>
+) {
+  return buildFileChanges({
+    session: observedState(),
+    sessionId: 'session-1',
+    baselineMode: 'session',
+    localBaselines: new Map(),
+    workspaceRoots: [ROOT],
+    exclude: [],
+    maxFileSizeBytes: 1024 * 1024,
+    readBackup: async (name) => (name === 'v1@v1' ? 'line1\nline2\n' : null),
+    readCurrent: async () => ({ text: currentText, missing: false }),
+    observedContents: observed,
+    diskChangeAt,
+    skipped
+  });
+}
+
+test('a disk change keeps its timestamp on later builds', async () => {
+  const observed = new Map<string, string | null>([[pathKey(FILE), 'line1\nline2\n']]);
+  const diskChangeAt = new Map<string, number>();
+  const first = await buildDiskChange('line1\nline2\nline3\n', observed, diskChangeAt);
+  assert.ok(first[0].observedChangeAt > 0);
+  const stamp = first[0].observedChangeAt;
+  // The next build sees the same content (no new move) but must keep
+  // reporting the moment it changed, otherwise the disk-only signal would be
+  // lost before it could ever open the review.
+  const second = await buildDiskChange('line1\nline2\nline3\n', observed, diskChangeAt);
+  assert.equal(second[0].observedChangeAt, stamp);
+});
+
+test('stable content keeps no observed-change timestamp', async () => {
+  const observed = new Map<string, string | null>([[pathKey(FILE), 'line1\nline2\nline3\n']]);
+  const diskChangeAt = new Map<string, number>();
+  const changes = await buildDiskChange('line1\nline2\nline3\n', observed, diskChangeAt);
+  assert.equal(changes[0].observedChangeAt, 0);
+  assert.equal(diskChangeAt.size, 0);
+});
+
+test('an unreadable file is reported instead of counting as no change', async () => {
+  const skipped = new Map<string, string>();
+  const changes = await buildFileChanges({
+    session: observedState(),
+    sessionId: 'session-1',
+    baselineMode: 'session',
+    localBaselines: new Map(),
+    workspaceRoots: [ROOT],
+    exclude: [],
+    maxFileSizeBytes: 1024 * 1024,
+    readBackup: async (name) => (name === 'v1@v1' ? 'line1\nline2\n' : null),
+    readCurrent: async () => ({ text: '', missing: false, unreadable: true }),
+    observedContents: new Map(),
+    skipped
+  });
+  assert.equal(changes.length, 0);
+  assert.equal(skipped.get(pathKey(FILE)), 'unreadable');
+});
+
+test('a missing backup is reported instead of counting as no change', async () => {
+  const skipped = new Map<string, string>();
+  const changes = await buildFileChanges({
+    session: observedState(),
+    sessionId: 'session-1',
+    baselineMode: 'session',
+    localBaselines: new Map(),
+    workspaceRoots: [ROOT],
+    exclude: [],
+    maxFileSizeBytes: 1024 * 1024,
+    readBackup: async () => null,
+    readCurrent: async () => ({ text: 'line1\nline2\nline3\n', missing: false }),
+    skipped
+  });
+  assert.equal(changes.length, 0);
+  assert.equal(skipped.get(pathKey(FILE)), 'baseline');
+});
+
 test('a disk-only edit opens the review when observed after the accepted watermark', async () => {
   const observed = new Map<string, string | null>([[pathKey(FILE), 'line1\nline2\n']]);
   const changes = await buildObserved(observed);

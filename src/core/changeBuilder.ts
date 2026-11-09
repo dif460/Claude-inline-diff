@@ -43,10 +43,12 @@ export interface FileChange {
    */
   restoredFromBackup: boolean;
   /**
-   * Wall-clock time (ms) of the build that first saw this file's content move
-   * away from the previous observation, or 0 when it had already settled.
-   * This lets edits Claude makes without a file-history event (shell commands,
-   * scripts, codegen) surface as soon as they land on disk.
+   * Wall-clock time (ms) at which this file's content was last seen moving
+   * away from the previous observation, or 0 when it has not moved since the
+   * extension started watching it. This lets edits Claude makes without a
+   * file-history event (shell commands, scripts, codegen) surface as soon as
+   * they land on disk — and stay reported on later builds, so the signal is
+   * not lost when the build that first saw the move could not surface it.
    */
   observedChangeAt: number;
 }
@@ -65,13 +67,28 @@ export interface BuildChangesInput {
   exclude: string[];
   maxFileSizeBytes: number;
   readBackup: (backupFileName: string) => Promise<string | null>;
-  readCurrent: (fsPath: string) => Promise<{ text: string; missing: boolean; tooLarge?: boolean }>;
+  readCurrent: (
+    fsPath: string
+  ) => Promise<{ text: string; missing: boolean; tooLarge?: boolean; unreadable?: boolean }>;
   /**
    * Last content the caller observed per path (null means the file was
    * missing). Mutated in place on every build so the next one can tell a new
    * Claude edit apart from a rewind to previously recorded content.
    */
   observedContents?: Map<string, string | null>;
+  /**
+   * Wall-clock time (ms) at which each path's content was last seen moving on
+   * disk. Unlike a per-build flag this survives later builds, so a disk change
+   * that could not be surfaced right away is still reported afterwards.
+   */
+  diskChangeAt?: Map<string, number>;
+  /**
+   * Paths whose diff could not be computed this time (missing backup or an
+   * unreadable file). Mutated in place; a non-empty map means the view of the
+   * working tree is incomplete and the caller must not treat "no changes" as
+   * "everything reviewed".
+   */
+  skipped?: Map<string, string>;
   log?: (message: string) => void;
 }
 
@@ -337,6 +354,7 @@ export async function buildFileChanges(input: BuildChangesInput): Promise<FileCh
       ? { text: localBaseline.text, existed: true }
       : await resolveTranscriptBaseline(candidate, input);
     if (baseline === undefined) {
+      input.skipped?.set(key, 'baseline');
       input.log?.(`Skipping ${candidate.displayPath}: original snapshot is unavailable.`);
       continue;
     }
@@ -353,6 +371,11 @@ export async function buildFileChanges(input: BuildChangesInput): Promise<FileCh
     }
 
     const current = await input.readCurrent(candidate.displayPath);
+    if (current.unreadable) {
+      input.skipped?.set(key, 'unreadable');
+      input.log?.(`Skipping ${candidate.displayPath}: file could not be read.`);
+      continue;
+    }
     if (current.tooLarge) {
       input.log?.(`Skipping ${candidate.displayPath}: file is too large.`);
       continue;
@@ -376,6 +399,11 @@ export async function buildFileChanges(input: BuildChangesInput): Promise<FileCh
     const previousValue = input.observedContents?.get(key);
     const contentMoved = previousValue !== undefined && previousValue !== observedValue;
     input.observedContents?.set(key, observedValue);
+    let diskChangeAt = input.diskChangeAt?.get(key) ?? 0;
+    if (contentMoved) {
+      diskChangeAt = Date.now();
+      input.diskChangeAt?.set(key, diskChangeAt);
+    }
     const restoredFromBackup =
       contentMoved &&
       (await matchesRecordedBackup(candidate, current.missing, cleanCurrent, input.readBackup));
@@ -403,7 +431,7 @@ export async function buildFileChanges(input: BuildChangesInput): Promise<FileCh
       removedCount: diff.removedCount,
       lastClaudeEventAt: parseTimestamp(candidate.events[candidate.events.length - 1]?.timestamp),
       restoredFromBackup,
-      observedChangeAt: contentMoved ? Date.now() : 0
+      observedChangeAt: diskChangeAt
     });
   }
 

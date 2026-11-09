@@ -52,6 +52,12 @@ const COMPLETION_QUIET_MS = 5000;
  * give the write time to land before deciding that an event produced no diff.
  */
 const CLAUDE_EVENT_SETTLE_MS = 5000;
+/**
+ * How long an incomplete build (a file skipped because its backup or content
+ * could not be read) keeps the reviewed watermark from advancing. Long enough
+ * for a transient Windows sharing violation or a late file write to clear up.
+ */
+const INCOMPLETE_GRACE_MS = 15_000;
 
 interface Settings {
   enabled: boolean;
@@ -62,6 +68,7 @@ interface Settings {
   maxFileSizeBytes: number;
   exclude: string[];
   showCompletionStatus: boolean;
+  debugLog: boolean;
 }
 
 function readSettings(): Settings {
@@ -75,7 +82,8 @@ function readSettings(): Settings {
     maxFileSizeKB,
     maxFileSizeBytes: maxFileSizeKB * 1024,
     exclude: config.get<string[]>('exclude', []),
-    showCompletionStatus: config.get<boolean>('showCompletionStatus', true)
+    showCompletionStatus: config.get<boolean>('showCompletionStatus', true),
+    debugLog: config.get<boolean>('debugLog', false)
   };
 }
 
@@ -103,6 +111,16 @@ function formatRelative(timestampMs: number): string {
 
 function logLine(output: vscode.OutputChannel, message: string): void {
   output.appendLine(`[${new Date().toLocaleTimeString()}] ${message}`);
+}
+
+/** Clock-only rendering of a transcript event timestamp, for debug logs. */
+function formatClock(timestampMs: number): string {
+  if (!timestampMs) {
+    return '—';
+  }
+  const date = new Date(timestampMs);
+  const pad = (value: number, width = 2): string => String(value).padStart(width, '0');
+  return `${pad(date.getHours())}:${pad(date.getMinutes())}:${pad(date.getSeconds())}.${pad(date.getMilliseconds(), 3)}`;
 }
 
 interface SessionQuickPickItem extends vscode.QuickPickItem {
@@ -135,6 +153,15 @@ export class ClaudeInlineDiffController implements vscode.Disposable {
    * apart from a new edit instead of being recorded as a new change.
    */
   private readonly observedContents = new Map<string, string | null>();
+  /** Last wall-clock time each path's content moved on disk (survives builds). */
+  private readonly diskChangeAt = new Map<string, number>();
+  /**
+   * When the working tree first looked incomplete (a file skipped because its
+   * backup or its content could not be read). Kept so a transient read failure
+   * holds the review watermark back instead of losing a Claude edit, while a
+   * permanently unreadable file still lets the watermark move on.
+   */
+  private incompleteSince: number | undefined;
   private changes: FileChange[] = [];
   private changesByKey = new Map<string, FileChange>();
   private pinnedSessionId: string | undefined;
@@ -153,6 +180,13 @@ export class ClaudeInlineDiffController implements vscode.Disposable {
    * themselves.
    */
   private reviewedThrough = 0;
+  /**
+   * Newest transcript event that a previous build has already evaluated. The
+   * watermark may only advance up to this point, so an event that is parsed
+   * and consumed within the same build can never be marked as reviewed before
+   * its diff had a chance to appear on disk.
+   */
+  private latestEventSeen = 0;
   private lastEndTurnTimestamp: string | undefined;
   private lastTranscriptActivityAt = 0;
   /**
@@ -570,11 +604,19 @@ export class ClaudeInlineDiffController implements vscode.Disposable {
       }
       const transcript = parser.getState();
       const latestEvent = latestClaudeEventTime(transcript);
-      const settledEvent = Math.min(latestEvent, Date.now() - CLAUDE_EVENT_SETTLE_MS);
+      // An event may only be marked reviewed once an *earlier* build has
+      // evaluated it. Otherwise an event parsed for the first time together
+      // with its (possibly not yet written) file would be swallowed whenever
+      // the parse itself lagged behind the event by more than the settle
+      // window, and the edit would stay hidden until Claude's next action.
+      const consumableEvent = Math.min(
+        Math.min(latestEvent, Date.now() - CLAUDE_EVENT_SETTLE_MS),
+        this.latestEventSeen
+      );
       // Settled Claude activity with an empty review still needs one rebuild to
       // advance the watermark, otherwise a later external edit would look like
       // a fresh Claude change.
-      const shouldSettle = this.changes.length === 0 && settledEvent > this.reviewedThrough;
+      const shouldSettle = this.changes.length === 0 && consumableEvent > this.reviewedThrough;
       const shouldBuild = force || update.changed || this.workspaceDirty || shouldSettle;
       this.workspaceDirty = false;
       if (!shouldBuild) {
@@ -591,6 +633,7 @@ export class ClaudeInlineDiffController implements vscode.Disposable {
         endTurn !== previousEndTurn;
 
       const sessionId = target.sessionId;
+      const skipped = new Map<string, string>();
       const built = await buildFileChanges({
         session: parser.getState(),
         sessionId,
@@ -602,8 +645,12 @@ export class ClaudeInlineDiffController implements vscode.Disposable {
         readBackup: (backupFileName) => this.fileHistory.readBackup(sessionId, backupFileName),
         readCurrent: (fsPath) => this.readCurrent(fsPath),
         observedContents: this.observedContents,
+        diskChangeAt: this.diskChangeAt,
+        skipped,
         log: (message) => logLine(this.output, message)
       });
+      // Everything up to `latestEvent` has now been evaluated by a build.
+      this.latestEventSeen = Math.max(this.latestEventSeen, latestEvent);
 
       // A rollback inside Claude restores files to earlier backups. That is
       // Claude withdrawing its own work, so fold the restored content into the
@@ -638,8 +685,29 @@ export class ClaudeInlineDiffController implements vscode.Disposable {
         openedByDiskChange ? observedSince : Number.POSITIVE_INFINITY
       );
       this.lastBuildAt = Date.now();
-      if (changes.length === 0) {
-        await this.consumeClaudeActivity(settledEvent);
+      // The grace window only matters while the review is empty; with changes
+      // on screen nothing is consumed anyway.
+      if (skipped.size === 0 || changes.length > 0) {
+        this.incompleteSince = undefined;
+      } else if (this.incompleteSince === undefined) {
+        this.incompleteSince = Date.now();
+      }
+      const givingUpOnSkips =
+        this.incompleteSince !== undefined && Date.now() - this.incompleteSince > INCOMPLETE_GRACE_MS;
+      // A skipped file means the working tree was not fully evaluated, so an
+      // empty result does not mean "everything is reviewed". Hold the
+      // watermark back briefly so a transient read failure cannot swallow a
+      // Claude edit, but do not block it forever on a permanently broken file.
+      if (changes.length === 0 && (skipped.size === 0 || givingUpOnSkips)) {
+        await this.consumeClaudeActivity(consumableEvent);
+      }
+      if (this.settings.debugLog) {
+        logLine(
+          this.output,
+          `刷新 · 会话 ${sessionId.slice(0, 8)} · 事件 ${formatClock(latestEvent)}` +
+            ` · 可结算 ${formatClock(consumableEvent)} · 水位 ${formatClock(this.reviewedThrough)}` +
+            ` · 待审 ${changes.length} · 跳过 ${skipped.size}${givingUpOnSkips ? '（超时放行）' : ''}`
+        );
       }
       await this.applyChanges(changes);
       if (completedTurn && changes.length > 0) {
@@ -683,20 +751,42 @@ export class ClaudeInlineDiffController implements vscode.Disposable {
     const firstDiscovery = !this.sawFirstDiscovery;
     this.sawFirstDiscovery = true;
     let active: SessionCandidate | undefined;
+    let newlyAppeared: SessionCandidate | undefined;
     for (const session of sessions) {
       const previous = this.sessionSizes.get(session.sessionId);
+      const isNew = previous === undefined && !firstDiscovery;
       const grew = previous
         ? session.size > previous.size || session.mtimeMs > previous.mtimeMs
         : !firstDiscovery;
-      if (grew && (active === undefined || session.mtimeMs > active.mtimeMs)) {
-        active = session;
+      if (grew) {
+        if (active === undefined || session.mtimeMs > active.mtimeMs) {
+          active = session;
+        }
+        if (isNew && (newlyAppeared === undefined || session.mtimeMs > newlyAppeared.mtimeMs)) {
+          newlyAppeared = session;
+        }
       }
     }
     this.sessionSizes.clear();
     for (const session of sessions) {
       this.sessionSizes.set(session.sessionId, { size: session.size, mtimeMs: session.mtimeMs });
     }
-    return this.windowFocused ? active : undefined;
+    if (this.windowFocused) {
+      return active;
+    }
+    // Other windows can share this workspace, so a session that merely keeps
+    // growing may belong to them and only counts while this window is focused.
+    // A session that did not exist a moment ago is a conversation started
+    // after we last looked; waiting for focus would leave this window stuck on
+    // the previous conversation for as long as Claude keeps working in the new
+    // one, so adopt it even in the background.
+    if (newlyAppeared) {
+      logLine(
+        this.output,
+        `后台发现新会话 ${newlyAppeared.sessionId.slice(0, 8)}，切换跟踪目标。`
+      );
+    }
+    return newlyAppeared;
   }
 
   private pickSession(
@@ -736,6 +826,9 @@ export class ClaudeInlineDiffController implements vscode.Disposable {
     this.parser = new TranscriptParser(session.filePath);
     this.watchTranscript(session.filePath);
     this.fileHistory.clear();
+    this.latestEventSeen = 0;
+    this.diskChangeAt.clear();
+    this.incompleteSince = undefined;
     this.lastEndTurnTimestamp = undefined;
     this.lastTranscriptActivityAt = 0;
     this.lastAcceptedAt = 0;
@@ -751,7 +844,9 @@ export class ClaudeInlineDiffController implements vscode.Disposable {
     );
   }
 
-  private async readCurrent(fsPath: string): Promise<{ text: string; missing: boolean; tooLarge?: boolean }> {
+  private async readCurrent(
+    fsPath: string
+  ): Promise<{ text: string; missing: boolean; tooLarge?: boolean; unreadable?: boolean }> {
     // While this window still has unreviewed Claude changes, a manually edited
     // buffer (including unsaved changes) is reviewed alongside them. Once the
     // review is finished, the on-disk content is authoritative again.
@@ -781,8 +876,9 @@ export class ClaudeInlineDiffController implements vscode.Disposable {
       if ((error as NodeJS.ErrnoException).code === 'ENOENT') {
         return { text: '', missing: true };
       }
-      // Unreadable files are skipped rather than rendered as fully deleted.
-      return { text: '', missing: false, tooLarge: true };
+      // Distinguish a read failure from a genuinely oversized file: the former
+      // is transient and must not let the review watermark move on.
+      return { text: '', missing: false, unreadable: true };
     }
   }
 
@@ -805,6 +901,9 @@ export class ClaudeInlineDiffController implements vscode.Disposable {
     this.parser = undefined;
     this.localBaselines.clear();
     this.reviewedThrough = 0;
+    this.latestEventSeen = 0;
+    this.diskChangeAt.clear();
+    this.incompleteSince = undefined;
     this.lastAcceptedAt = 0;
     this.lastBuildAt = 0;
     this.lastEndTurnTimestamp = undefined;

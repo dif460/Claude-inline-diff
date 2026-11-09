@@ -16,14 +16,18 @@ export class FileHistoryReader {
       return this.cache.get(cacheKey) ?? null;
     }
     const backupPath = path.join(getFileHistoryRoot(), sessionId, backupFileName);
-    let text: string | null = null;
     try {
-      text = await fs.promises.readFile(backupPath, 'utf8');
+      const text = await fs.promises.readFile(backupPath, 'utf8');
+      this.cache.set(cacheKey, text);
+      return text;
     } catch {
-      text = null;
+      // Claude Code writes the backup around the same moment it appends the
+      // transcript line, so the first read can hit a sharing violation or a
+      // half-written file (Windows especially). Never cache that failure: the
+      // next build retries, otherwise the file would be skipped for the whole
+      // lifetime of the session binding.
+      return null;
     }
-    this.cache.set(cacheKey, text);
-    return text;
   }
 
   clear(): void {

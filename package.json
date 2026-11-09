@@ -2,7 +2,7 @@
   "name": "claude-inlineDiff",
   "displayName": "claude-inlineDiff",
   "description": "在真实编辑器内高亮 Claude Code 的改动，并提供 Trae 式逐块审核流程（单栏内联审查，无 Split Diff）。",
-  "version": "0.1.5",
+  "version": "0.1.6",
   "publisher": "Amireux",
   "private": true,
   "license": "MIT",
@@ -157,6 +157,11 @@
           "type": "boolean",
           "default": true,
           "description": "Claude 停止写入约 5 秒后，在状态栏短暂高亮待审文件数量（不弹窗）。"
+        },
+        "claudeInlineDiff.debugLog": {
+          "type": "boolean",
+          "default": false,
+          "description": "在“Claude Inline Diff”输出面板中记录每次刷新的判定依据（会话、事件时间、审核水位线、跳过文件数），用于排查改动显示延迟。"
         }
       }
     },
